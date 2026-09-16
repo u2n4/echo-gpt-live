@@ -1,0 +1,18 @@
+# secrets / local
+.env
+*.key
+*.pem
+secrets/
+# build
+bin/
+dist/
+*.exe
+# logs & captures
+logs/
+*.pcap
+*.pcapng
+runs/
+# editor
+.vscode/
+.idea/
+*.swp

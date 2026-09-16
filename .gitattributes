@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.go text eol=lf
+*.h264 binary
+*.ogg binary
+*.pcap binary

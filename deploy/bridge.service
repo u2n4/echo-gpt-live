@@ -1,0 +1,21 @@
+[Unit]
+Description=echo-gpt-live bridge - Echo Dot <-> GPT-Live full-duplex voice (behind Tailscale Funnel)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/echo-gpt-live
+EnvironmentFile=-%h/echo-gpt-live/bridge.env
+ExecStart=/bin/bash -c 'exec %h/echo-gpt-live/bin/bridge --run "svc-$(date -u +%%Y%%m%%dT%%H%%M%%SZ)" $BRIDGE_FLAGS'
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=append:%h/.local/state/rtcdiag/bridge.log
+StandardError=append:%h/.local/state/rtcdiag/bridge.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=rtcdiag - Alexa RTC diagnostic answerer (Pion). Listens on 127.0.0.1:8787 behind Tailscale Funnel.
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/echo-gpt-live
+# One experiment configuration per restart; edit RTCDIAG_FLAGS then `systemctl --user restart rtcdiag`.
+EnvironmentFile=-%h/echo-gpt-live/rtcdiag.env
+ExecStart=/bin/bash -c 'exec %h/echo-gpt-live/bin/rtcdiag --run "svc-$(date -u +%%Y%%m%%dT%%H%%M%%SZ)" $RTCDIAG_FLAGS'
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=append:%h/.local/state/rtcdiag/service.log
+StandardError=append:%h/.local/state/rtcdiag/service.log
+
+[Install]
+WantedBy=default.target
