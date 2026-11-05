@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -144,8 +145,8 @@ func TestStalledStreamIsDetected(t *testing.T) {
 	if err == nil {
 		t.Fatal("a stalled stream was accepted")
 	}
-	if !strings.Contains(err.Error(), "stalled") {
-		t.Fatalf("error should name the stall, got: %v", err)
+	if !errors.Is(err, ErrStreamDead) {
+		t.Fatalf("error should be ErrStreamDead, got: %v", err)
 	}
 	if el := time.Since(start); el > 2*time.Second {
 		t.Fatalf("watchdog took %v to fire; it should act on the stall budget", el)
@@ -163,8 +164,8 @@ func TestNoActivityAtAllIsDetected(t *testing.T) {
 	if err == nil {
 		t.Fatal("a silent stream was accepted")
 	}
-	if !strings.Contains(err.Error(), "no stream activity") {
-		t.Fatalf("error should name the missing first event, got: %v", err)
+	if !errors.Is(err, ErrStreamDead) {
+		t.Fatalf("error should be ErrStreamDead, got: %v", err)
 	}
 }
 
@@ -188,8 +189,8 @@ func TestEmptyAnswerAfterReasoningIsReportedAsStarved(t *testing.T) {
 	if err == nil {
 		t.Fatal("an empty answer was accepted as success")
 	}
-	if !strings.Contains(err.Error(), "reasoning tokens") {
-		t.Fatalf("error should explain the starved budget, got: %v", err)
+	if !errors.Is(err, ErrEmptyAnswer) {
+		t.Fatalf("error should be ErrEmptyAnswer, got: %v", err)
 	}
 	if !r.Truncated {
 		t.Fatal("incomplete_details should have marked the result truncated")

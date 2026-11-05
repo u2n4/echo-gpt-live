@@ -91,5 +91,7 @@ func (l *Logger) SaveSDP(name, sdp string) {
 		}
 		out = append(out, ln)
 	}
-	_ = os.WriteFile(filepath.Join(l.RunDir, name), []byte(strings.Join(out, "\n")), 0o600)
+	if err := os.WriteFile(filepath.Join(l.RunDir, name), []byte(strings.Join(out, "\n")), 0o600); err != nil {
+		l.Event("save_sdp_failed", "name", name, "err", err.Error())
+	}
 }

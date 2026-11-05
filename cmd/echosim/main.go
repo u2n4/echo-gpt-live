@@ -154,6 +154,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *dur)
 	defer cancel()
 	var outPkts atomic.Int64
+	var writeFails atomic.Int64
 	go func() {
 		quietAt := time.Time{}
 		if *speakFor > 0 {
@@ -184,8 +185,11 @@ func main() {
 					break
 				}
 				if len(p) > 0 {
-					_ = audio.WriteSample(media.Sample{Data: p, Duration: 20 * time.Millisecond})
-					outPkts.Add(1)
+					if err := audio.WriteSample(media.Sample{Data: p, Duration: 20 * time.Millisecond}); err != nil {
+						writeFails.Add(1)
+					} else {
+						outPkts.Add(1)
+					}
 				}
 				<-tk.C
 			}
@@ -196,7 +200,12 @@ func main() {
 	<-ctx.Done()
 	code, _ = post(*base, key, "/rtc/disconnected", map[string]any{"v": 1, "type": "disconnected", "sessionId": sid, "ts": float64(time.Now().UnixNano()) / 1e9, "nonce": uuid.NewString()})
 	time.Sleep(500 * time.Millisecond)
-	_ = pc.Close()
+	if err := pc.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "[echosim] pc close:", err)
+	}
+	if n := writeFails.Load(); n > 0 {
+		fmt.Fprintln(os.Stderr, "[echosim] audio write failures:", n)
+	}
 
 	// answer summary lines
 	var lines []string
@@ -208,10 +217,14 @@ func main() {
 			lines = append(lines, ln)
 		}
 	}
-	out, _ := json.MarshalIndent(map[string]any{
+	out, err := json.MarshalIndent(map[string]any{
 		"sessionId": sid, "answer_status": 200, "answer_ms": answerMs, "disconnect_status": code,
 		"ice_states": states, "audio_pkts_sent": outPkts.Load(), "audio_pkts_received": inPkts.Load(), "audio_seq_jumps": seqJumps.Load(), "audio_ts_jumps": tsJumps.Load(), "video_pkts_received": inVideo.Load(),
 		"first_audio_in_ms_after_offer": firstIn.Load() - t0.UnixMilli(), "answer_lines": lines,
 	}, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[echosim] summary:", err)
+		os.Exit(1)
+	}
 	fmt.Println(string(out))
 }

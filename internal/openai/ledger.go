@@ -23,13 +23,13 @@ package openai
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -55,7 +55,24 @@ func NewLedger(path string, ev func(string, ...any)) (*Ledger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	return &Ledger{path: path, ev: ev}, nil
+	l := &Ledger{path: path, ev: ev}
+	l.cleanStaleTmps()
+	return l, nil
+}
+
+// cleanStaleTmps removes the per-pid write files a crash left between Close and Rename. Only a
+// dead owner's litter is touched: never this process's, never a live sibling's in-flight file.
+// They were never read, so this is tidiness, not money.
+func (l *Ledger) cleanStaleTmps() {
+	matches, _ := filepath.Glob(l.path + ".*.tmp")
+	for _, m := range matches {
+		base := strings.TrimSuffix(strings.TrimPrefix(m, l.path+"."), ".tmp")
+		pid, err := strconv.Atoi(base)
+		if err != nil || pid == os.Getpid() || pidAlive(pid) {
+			continue
+		}
+		_ = os.Remove(m)
+	}
 }
 
 // Add records a session as open. Called immediately after creation, before anything else can fail.
@@ -88,7 +105,7 @@ func (l *Ledger) Add(id string) error {
 
 // Remove drops a session from the ledger after it has been confirmed hung up.
 func (l *Ledger) Remove(id string) {
-	_ = l.locked(func() error {
+	if err := l.locked(func() error {
 		es, err := l.read()
 		if err != nil {
 			return err
@@ -101,7 +118,9 @@ func (l *Ledger) Remove(id string) {
 		}
 		l.write(keep)
 		return nil
-	})
+	}); err != nil {
+		l.ev("ledger_remove_failed", "id", id, "err", err.Error())
+	}
 }
 
 // locked runs fn with the ledger held against every OTHER PROCESS as well as this one. The
@@ -120,11 +139,11 @@ func (l *Ledger) locked(fn func() error) error {
 		return err
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockFile(lock); err != nil {
 		l.ev("ledger_lock_failed", "err", err.Error())
 		return err
 	}
-	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = unlockFile(lock) }()
 	return fn()
 }
 
@@ -140,11 +159,14 @@ func (l *Ledger) Open() []string {
 // Entries lists the sessions the ledger believes are still billing, with what it knows of each.
 func (l *Ledger) Entries() []Entry {
 	var es []Entry
-	_ = l.locked(func() error {
+	if err := l.locked(func() error {
 		var err error
 		es, err = l.read()
 		return err
-	})
+	}); err != nil {
+		l.ev("ledger_entries_failed", "err", err.Error())
+		return nil
+	}
 	return es
 }
 
@@ -174,7 +196,10 @@ func (l *Ledger) read() ([]Entry, error) {
 			}
 		}
 		if len(fields) > 2 {
-			e.PID, _ = strconv.Atoi(strings.TrimSpace(fields[2]))
+			// Old lines have no PID; a bad number means zero, documented here, not silent.
+			if n, err := strconv.Atoi(strings.TrimSpace(fields[2])); err == nil {
+				e.PID = n
+			}
 		}
 		out = append(out, e)
 	}
@@ -195,10 +220,24 @@ func (l *Ledger) write(es []Entry) {
 		if !e.Started.IsZero() {
 			started = e.Started.Unix()
 		}
-		_, _ = fmt.Fprintf(f, "%s\t%d\t%d\n", e.ID, started, e.PID)
+		if _, err := fmt.Fprintf(f, "%s\t%d\t%d\n", e.ID, started, e.PID); err != nil {
+			l.ev("ledger_write_failed", "err", err.Error())
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return
+		}
 	}
-	_ = f.Sync()
-	_ = f.Close()
+	if err := f.Sync(); err != nil {
+		l.ev("ledger_write_failed", "err", err.Error())
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := f.Close(); err != nil {
+		l.ev("ledger_write_failed", "err", err.Error())
+		_ = os.Remove(tmp)
+		return
+	}
 	if err := os.Rename(tmp, l.path); err != nil {
 		l.ev("ledger_rename_failed", "err", err.Error())
 	}
@@ -211,6 +250,11 @@ type SweepOptions struct {
 	// MinAge leaves alone entries younger than this: they are being set up by a dial that has not
 	// yet handed its leg to anyone. Zero sweeps regardless of age.
 	MinAge time.Duration
+	// MaxLive bounds the trust in a living owner pid. Pids are reused: a session left by a
+	// crashed bridge whose pid a long-lived stranger inherited would otherwise be skipped by
+	// every sweep, billing until OpenAI's own limit. No session outlives its owner's hard cap,
+	// so past MaxLive plus a margin the pid is not believed. Zero keeps the old skip. Muse found it.
+	MaxLive time.Duration
 	// OnClosed is told about each session the sweep hung up: its id, when it was opened (zero if
 	// unknown), and whether THIS process opened it. A dead process's session was billing from
 	// Started until now and nobody charged it; one of our own was already charged when its leg
@@ -246,7 +290,7 @@ func (l *Ledger) SweepWith(ctx context.Context, c *LiveClient, o SweepOptions) {
 			continue
 		case o.MinAge > 0 && !e.Started.IsZero() && time.Since(e.Started) < o.MinAge:
 			continue
-		case e.PID != 0 && e.PID != self && pidAlive(e.PID):
+		case e.PID != 0 && e.PID != self && pidAlive(e.PID) && !o.pidTrustExpired(e):
 			// Not ours and its owner is still running: rtcdiag or another bridge. The first sweep
 			// hung these up too, which is how a diagnostic's session could be ended by the
 			// service starting next to it.
@@ -261,7 +305,7 @@ func (l *Ledger) SweepWith(ctx context.Context, c *LiveClient, o SweepOptions) {
 	l.ev("ledger_sweep_start", "orphans", len(due), "note", "sessions left open and still billing")
 	for _, e := range due {
 		err := c.HangupRetry(ctx, e.ID, 3)
-		if err == nil || strings.Contains(err.Error(), "404") {
+		if status, ok := httpStatus(err); err == nil || (ok && status == 404) {
 			l.Remove(e.ID)
 			l.ev("ledger_orphan_closed", "id", e.ID, "err_if_any", errText(err),
 				"open_for_s", openFor(e.Started).Seconds(), "own_pid", e.PID == self)
@@ -275,18 +319,19 @@ func (l *Ledger) SweepWith(ctx context.Context, c *LiveClient, o SweepOptions) {
 	}
 }
 
+// pidTrustExpired reports whether an entry is too old for its living owner pid to be believed.
+func (o SweepOptions) pidTrustExpired(e Entry) bool {
+	if o.MaxLive <= 0 || e.Started.IsZero() {
+		return false
+	}
+	return time.Since(e.Started) > o.MaxLive+time.Minute
+}
+
 func openFor(started time.Time) time.Duration {
 	if started.IsZero() {
 		return 0
 	}
 	return time.Since(started)
-}
-
-// pidAlive reports whether a process exists. Signal 0 delivers nothing and only checks; EPERM
-// means it exists and belongs to someone else, which is still alive.
-func pidAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
 }
 
 func errText(err error) string {
@@ -308,7 +353,10 @@ func (c *LiveClient) HangupRetry(ctx context.Context, sessionID string, attempts
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("hangup %s: %w (after %d attempts, last: %v)", sessionID, ctx.Err(), i, last)
+				if last != nil {
+					return errors.Join(fmt.Errorf("hangup %s", sessionID), ctx.Err(), last)
+				}
+				return fmt.Errorf("hangup %s: %w", sessionID, ctx.Err())
 			case <-time.After(time.Duration(i) * 500 * time.Millisecond):
 			}
 		}
@@ -318,7 +366,7 @@ func (c *LiveClient) HangupRetry(ctx context.Context, sessionID string, attempts
 		}
 		last = err
 		// An invalid or revoked key will not become valid on retry; say so once and stop.
-		if strings.Contains(err.Error(), "401") {
+		if status, ok := httpStatus(err); ok && status == 401 {
 			c.event("live_hangup_auth_failed", "id", sessionID,
 				"note", "the session may keep billing until its own limit; fix the API key and sweep")
 			return err

@@ -66,7 +66,7 @@ func HomeNetwork(endpoints []Endpoint, client *http.Client) *Tool {
 			what, _ := args["what"].(string)
 			ep, ok := byName[what]
 			if !ok {
-				return "", fmt.Errorf("I can only ask about: %s", strings.Join(names, ", "))
+				return "", fmt.Errorf("can only ask about: %s", strings.Join(names, ", "))
 			}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.URL, nil)
 			if err != nil {

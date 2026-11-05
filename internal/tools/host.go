@@ -151,7 +151,7 @@ func HostLogs(services []string) *Tool {
 			svc, _ := args["service"].(string)
 			// An allowlist, not a filter: an unnamed service is not read at all.
 			if !allowed[svc] {
-				return "", fmt.Errorf("I can only look at these services: %s", strings.Join(services, ", "))
+				return "", fmt.Errorf("can only look at these services: %s", strings.Join(services, ", "))
 			}
 			out, err := exec.CommandContext(ctx, "journalctl", "--user", "-u", svc,
 				"-p", "warning", "-n", "20", "--no-pager", "-o", "cat").Output()

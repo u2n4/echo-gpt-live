@@ -311,14 +311,16 @@ func insideRoot(root, path string) error {
 		return err
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("%s resolves outside the vault, to %s", path, realPath)
+		return fmt.Errorf("path %q resolves outside the vault", path)
 	}
 	return nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("vaultd: response encode failed: %v", err)
+	}
 }
 
 func hostname() string {

@@ -44,6 +44,42 @@ import (
 
 const responsesURL = "https://api.openai.com/v1/responses"
 
+// Shared sentinels. Match with errors.Is, never with string contains.
+var (
+	ErrNoAPIKey      = errors.New("no OpenAI API key")
+	ErrEmptyAnswer   = errors.New("backend produced no text")
+	ErrStreamDead    = errors.New("backend stream stalled")
+	ErrHTTPStatus    = errors.New("backend HTTP status")
+	ErrReasoningGone = errors.New("backend reasoning field rejected")
+	ErrBadSDP        = errors.New("create call: response is not SDP")
+	ErrNoCallID      = errors.New("create call: no call_id in Location header")
+)
+
+// StatusError carries an HTTP status for retry decisions. Match with errors.As,
+// never with strings.Contains(err.Error(), "404").
+type StatusError struct {
+	Op     string
+	Status int
+}
+
+func (e *StatusError) Error() string {
+	if e == nil {
+		return "backend HTTP status"
+	}
+	if e.Op != "" {
+		return fmt.Sprintf("%s: HTTP %d", e.Op, e.Status)
+	}
+	return fmt.Sprintf("HTTP %d", e.Status)
+}
+
+func httpStatus(err error) (int, bool) {
+	var se *StatusError
+	if err != nil && errors.As(err, &se) {
+		return se.Status, true
+	}
+	return 0, false
+}
+
 // Progress budgets. These bound INACTIVITY, not the length of a correct answer.
 const (
 	// DefaultFirstEvent covers connect plus the model starting to emit anything, including a
@@ -136,6 +172,22 @@ type apiError struct {
 	Type    string `json:"type"`
 }
 
+func (e *apiError) Error() string {
+	if e == nil {
+		return "backend error"
+	}
+	if e.Code != "" && e.Message != "" {
+		return e.Code + ": " + e.Message
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Code != "" {
+		return e.Code
+	}
+	return "backend error"
+}
+
 type responseObject struct {
 	Status            string   `json:"status"`
 	OutputText        []string `json:"output_text"`
@@ -217,14 +269,17 @@ func (b *Backend) Ask(ctx context.Context, kind, instructions, question string, 
 	defer res.Body.Close()
 
 	if res.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		msg := truncate(string(raw), 400)
+		raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		if err != nil {
+			return nil, fmt.Errorf("backend %s (%s): %w", b.Model, effort, err)
+		}
 		var e struct{ Error *apiError }
 		if json.Unmarshal(raw, &e) == nil && e.Error != nil {
-			msg = e.Error.Code + ": " + e.Error.Message
+			b.event("backend_error", "model", b.Model, "effort", effort, "status", res.StatusCode, "code", e.Error.Code)
+			return nil, fmt.Errorf("backend %s (%s): %w", b.Model, effort, e.Error)
 		}
-		b.event("backend_error", "model", b.Model, "effort", effort, "status", res.StatusCode, "err", msg)
-		return nil, fmt.Errorf("backend %s (%s): HTTP %d: %s", b.Model, effort, res.StatusCode, msg)
+		b.event("backend_error", "model", b.Model, "effort", effort, "status", res.StatusCode, "bytes", len(raw))
+		return nil, fmt.Errorf("backend %s (%s): %w", b.Model, effort, &StatusError{Op: "backend", Status: res.StatusCode})
 	}
 
 	tHeaders := time.Now()
@@ -259,8 +314,9 @@ func (b *Backend) Ask(ctx context.Context, kind, instructions, question string, 
 		// An empty answer after reasoning tokens were spent means the budget went to thinking,
 		// not that the endpoint is dead. Say so, so the caller raises the budget or lowers the
 		// effort instead of blaming the provider.
-		return out, fmt.Errorf("backend %s (%s) produced no text after %d reasoning tokens in %.1fs; raise max_output_tokens or lower the effort",
-			b.Model, effort, out.ReasoningTokens, out.Elapsed.Seconds())
+		b.event("backend_empty_answer", "model", b.Model, "effort", effort,
+			"reasoning_tokens", out.ReasoningTokens, "out_tokens", out.OutputTokens)
+		return out, fmt.Errorf("backend %s (%s): %w", b.Model, effort, ErrEmptyAnswer)
 	}
 	return out, nil
 }
@@ -280,6 +336,11 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 	// The reader runs in its own goroutine so the watchdog can act while it is blocked on Read.
 	// The HTTP body is closed by the caller's defer, which unblocks this goroutine.
 	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				lines <- line{err: fmt.Errorf("%w: %v", ErrStreamDead, p)}
+			}
+		}()
 		sc := bufio.NewScanner(body)
 		sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 		for sc.Scan() {
@@ -307,12 +368,14 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 		mu.Lock()
 		idle := time.Since(lastAt)
 		seen := firstSeen
+		events := out.Events
 		mu.Unlock()
 		if !seen && idle >= b.FirstEvent {
-			return fmt.Errorf("backend %s: no stream activity at all within %s of the stream opening — treating as dead", b.Model, b.FirstEvent)
+			return fmt.Errorf("backend %s: %w", b.Model, ErrStreamDead)
 		}
 		if seen && idle >= b.Stall {
-			return fmt.Errorf("backend %s: stream stalled for %s after %d events — treating as dead", b.Model, b.Stall, out.Events)
+			b.event("backend_stall", "model", b.Model, "events", events)
+			return fmt.Errorf("backend %s: %w", b.Model, ErrStreamDead)
 		}
 		return nil
 	}
@@ -332,7 +395,7 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("backend %s: %w after %.1fs (safety cap, not the model's deadline)", b.Model, ctx.Err(), time.Since(t0).Seconds())
+			return fmt.Errorf("backend %s: %w (safety cap, not the model's deadline)", b.Model, ctx.Err())
 		case <-timer.C:
 			if err := expired(); err != nil {
 				return err
@@ -381,11 +444,10 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 			}
 			switch {
 			case env.Type == "error" || env.Error != nil:
-				msg := "unknown error"
 				if env.Error != nil {
-					msg = env.Error.Code + ": " + env.Error.Message
+					return &apiError{Code: env.Error.Code, Message: env.Error.Message, Type: env.Error.Type}
 				}
-				return errors.New("backend stream error: " + msg)
+				return fmt.Errorf("backend %s: %w", b.Model, ErrHTTPStatus)
 
 			case strings.HasSuffix(env.Type, "output_text.delta"):
 				answer.WriteString(env.Delta)
@@ -408,11 +470,10 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 					out.Text = strings.TrimSpace(answer.String())
 				}
 				if env.Type == "response.failed" {
-					msg := "response failed"
 					if env.Response != nil && env.Response.Error != nil {
-						msg = env.Response.Error.Code + ": " + env.Response.Error.Message
+						return &apiError{Code: env.Response.Error.Code, Message: env.Response.Error.Message, Type: env.Response.Error.Type}
 					}
-					return errors.New("backend: " + msg)
+					return fmt.Errorf("backend %s: %w", b.Model, ErrHTTPStatus)
 				}
 				return nil
 			}

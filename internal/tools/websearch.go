@@ -26,13 +26,9 @@ package tools
 // answers. The reader hop is the one that actually works today, and it has a cost that is not
 // money: a third party sees the question. That is why `--web-search=private` exists to refuse it.
 //
-// Two things this deliberately does NOT do:
-//
-//   - It never opens a result page. Only the engine's own titles and snippets come back. Fetching a
-//     result would mean the model reads whatever a stranger wrote as part of its own instructions,
-//     and snippets already answer the question he actually asks.
-//   - It never takes a URL. The model supplies words, never an address, for the same reason nothing
-//     else in this package does.
+// One thing this deliberately does NOT do: it never takes a URL. The model supplies words, never an
+// address, for the same reason nothing else in this package does. Opening a page happens in
+// openresult.go, and there too the model names a result the engine showed it, never an address.
 
 import (
 	"context"
@@ -44,13 +40,15 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// How much of the web comes back. Four results at 220 characters is enough for the model to answer
-// a spoken question and short enough that the tokens stay free in all but name.
+// How much of the web comes back. Six results at 220 characters is enough for the model to answer
+// a spoken question, or to pick the one page worth opening, and short enough that the tokens stay
+// free in all but name.
 const (
-	freeResults = 4
+	freeResults = 6
 	freeSnippet = 220
 )
 
@@ -75,25 +73,65 @@ type webResult struct {
 	Title   string
 	Snippet string
 	Where   string
+	// URL is where the result actually leads, decoded from the engine's redirect. The model never
+	// sees it as an address to choose; open_result reaches it by the result's number.
+	URL string
 }
 
-// WebSearch is the free search tool. It is a Read: it changes nothing, so it runs without asking.
-func WebSearch(client *http.Client, depth SearchDepth) *Tool {
+// Web is the free search and the page it opens afterwards. They share one memory - the results of
+// the last search - so that "open result 3" means something the model was shown, not something
+// it typed.
+type Web struct {
+	client *http.Client // the engines and the reader service
+	pages  *http.Client // result pages: public addresses only, checked at dial time
+	depth  SearchDepth
+	mu     sync.Mutex
+	last   []webResult
+}
+
+// NewWeb builds the search and its reader.
+func NewWeb(client *http.Client, depth SearchDepth) *Web {
 	if client == nil {
 		client = &http.Client{Timeout: 8 * time.Second}
 	}
+	return &Web{client: client, pages: pageClient(), depth: depth}
+}
+
+// WebSearch is the free search tool on its own, for callers that do not open pages.
+func WebSearch(client *http.Client, depth SearchDepth) *Tool {
+	return NewWeb(client, depth).SearchTool()
+}
+
+func (w *Web) keep(hits []webResult) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.last = hits
+}
+
+func (w *Web) result(n int) (webResult, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if n < 1 || n > len(w.last) {
+		return webResult{}, false
+	}
+	return w.last[n-1], true
+}
+
+// SearchTool is the free search. It is a Read: it changes nothing, so it runs without asking.
+func (w *Web) SearchTool() *Tool {
 	return &Tool{
 		Name: "web_search",
 		Description: "Search the web for something current or outside your knowledge: news, prices, " +
-			"scores, today's weather, anything after your training. Answers 'ابحث في النت', " +
-			"'وش صار في', 'what is the price of', 'who won'. Use it only when the answer really " +
-			"depends on the outside world.",
+			"scores, anything after your training. Answers 'ابحث في النت', 'وش صار في', 'what is " +
+			"the price of', 'who won'. Use it only when the answer really depends on the outside " +
+			"world. For a price or a product in Saudi Arabia, an English query with the country " +
+			"in it finds shops and price comparisons that an Arabic one misses.",
 		Params: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "what to search for, in the language the question was asked in",
+					"description": "what to search for: a short phrase, not the whole question",
 				},
 			},
 			"required": []string{"query"},
@@ -105,11 +143,22 @@ func WebSearch(client *http.Client, depth SearchDepth) *Tool {
 			if q == "" {
 				return "", fmt.Errorf("nothing to search for")
 			}
-			if len(q) > 300 {
-				q = q[:300]
+			// Characters, not bytes: an Arabic letter is two bytes, and a byte cut in the middle
+			// of one sent the engine an invalid tail.
+			if r := []rune(q); len(r) > 300 {
+				q = string(r[:300])
 			}
-
-			return searchNow(ctx, client, depth, q)
+			hits, err := searchNow(ctx, w.client, w.depth, q)
+			if err != nil {
+				return "", err
+			}
+			if len(hits) == 0 {
+				return fmt.Sprintf("The search found nothing about %q.", q), nil
+			}
+			w.keep(hits)
+			// The first three pages come with the snippets, unasked, so the answer does not
+			// need another round to open them and can speak from more than one site.
+			return render(hits) + w.peek(ctx, hits), nil
 		},
 	}
 }
@@ -129,7 +178,7 @@ func WebSearch(client *http.Client, depth SearchDepth) *Tool {
 // Preference is still ordered, because "fastest" and "best" are not the same: the engine's own
 // results beat an encyclopedia article for "how hot is it today". So this waits for a better rung
 // only while one is still plausibly coming, and answers the moment the best outstanding one lands.
-func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, q string) (string, error) {
+func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, q string) ([]webResult, error) {
 	type rung struct {
 		rank int // lower is better; the engine beats the encyclopedia
 		name string
@@ -153,6 +202,11 @@ func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, q st
 	out := make(chan answer, len(rungs))
 	for _, r := range rungs {
 		go func(r rung) {
+			defer func() {
+				if p := recover(); p != nil {
+					out <- answer{r.rank, r.name, nil, fmt.Errorf("%s panicked: %v", r.name, p)}
+				}
+			}()
 			hits, err := r.run(ctx, client, q)
 			out <- answer{r.rank, r.name, hits, err}
 		}(r)
@@ -193,14 +247,17 @@ func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, q st
 		}
 	}
 	if best.rank < 99 {
-		return render(best.hits), nil
+		if len(best.hits) > freeResults {
+			best.hits = best.hits[:freeResults]
+		}
+		return best.hits, nil
 	}
 	if lastErr != nil {
 		// "Nothing was found" and "the search itself did not work" are different sentences to say
 		// out loud, so they are different returns here.
-		return "", fmt.Errorf("the search did not go through: %w", lastErr)
+		return nil, fmt.Errorf("the search did not go through: %w", lastErr)
 	}
-	return fmt.Sprintf("The search found nothing about %q.", q), nil
+	return nil, nil
 }
 
 func render(hits []webResult) string {
@@ -230,11 +287,37 @@ func render(hits []webResult) string {
 // (?s) is load-bearing and was missing: the page puts the opening tag and the text on different
 // lines, and without it `.` stops at the newline, so every snippet silently disappeared while the
 // titles and domains — which do sit on one line — came through and made it look fine.
-var liteRE = regexp.MustCompile(`(?s)class=['"]result-link['"][^>]*>(.*?)</a>` +
+var liteRE = regexp.MustCompile(`(?s)<a([^>]*class=['"]result-link['"][^>]*)>(.*?)</a>` +
 	`|class=['"]result-snippet['"][^>]*>(.*?)</td>` +
 	`|class=['"]link-text['"][^>]*>(.*?)</span>`)
 
-var tagRE = regexp.MustCompile(`<[^>]*>`)
+var (
+	tagRE  = regexp.MustCompile(`<[^>]*>`)
+	hrefRE = regexp.MustCompile(`href=['"]([^'"]*)['"]`)
+)
+
+// resultURL turns the engine's link into the page it leads to. DuckDuckGo wraps every result in
+// a redirect through its own host with the destination in `uddg`; the destination is what a
+// reader can open, and the redirect is what it must not follow blindly.
+func resultURL(href string) string {
+	href = strings.TrimSpace(html.UnescapeString(href))
+	if strings.HasPrefix(href, "//") {
+		href = "https:" + href
+	}
+	u, err := url.Parse(href)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+	if strings.HasSuffix(u.Host, "duckduckgo.com") {
+		if dest := u.Query().Get("uddg"); dest != "" {
+			if d, err := url.Parse(dest); err == nil && (d.Scheme == "http" || d.Scheme == "https") {
+				return dest
+			}
+		}
+		return ""
+	}
+	return href
+}
 
 // ddgBase is a variable only so the tests can point this at a local server. Nothing reachable from
 // a spoken sentence can change it.
@@ -254,15 +337,19 @@ func ddgLiteFrom(ctx context.Context, client *http.Client, u string, hdr map[str
 	var out []webResult
 	for _, m := range liteRE.FindAllStringSubmatch(page, -1) {
 		switch {
-		case m[1] != "":
-			out = append(out, webResult{Title: clean(m[1])})
 		case m[2] != "":
-			if len(out) > 0 && out[len(out)-1].Snippet == "" {
-				out[len(out)-1].Snippet = clean(m[2])
+			r := webResult{Title: clean(m[2])}
+			if h := hrefRE.FindStringSubmatch(m[1]); h != nil {
+				r.URL = resultURL(h[1])
 			}
+			out = append(out, r)
 		case m[3] != "":
+			if len(out) > 0 && out[len(out)-1].Snippet == "" {
+				out[len(out)-1].Snippet = clean(m[3])
+			}
+		case m[4] != "":
 			if len(out) > 0 && out[len(out)-1].Where == "" {
-				out[len(out)-1].Where = clean(m[3])
+				out[len(out)-1].Where = clean(m[4])
 			}
 		}
 		if len(out) > freeResults*2 {
@@ -282,18 +369,20 @@ func ddgLiteFrom(ctx context.Context, client *http.Client, u string, hdr map[str
 // readerBase fetches a page on our behalf and returns its text. It needs no account and no key.
 var readerBase = "https://r.jina.ai/"
 
-// numbered matches the reader's plain-text rendering of a result list: a number, then the title,
-// then indented lines for the snippet and the visible domain.
+// numbered matches the reader's markdown rendering of a result list: a number, then the title as
+// a link with the engine's redirect as its address, then lines for the snippet and the visible
+// domain. Markdown rather than plain text because the address is what open_result needs, and the
+// plain rendering drops it.
 //
 // The separators are NON-BREAKING spaces, U+00A0, not ordinary ones. Go's `\s` is ASCII-only, so a
 // pattern written with it matches the page as a person reads it and not the page as it arrives.
 // \pZ is every Unicode space, which is what is actually on the wire.
-var numbered = regexp.MustCompile(`(?m)^[\pZ\t]*(\d{1,2})\.[\pZ\t]+(\S.*)$`)
+var numbered = regexp.MustCompile(`(?m)^[\pZ\t]*(\d{1,2})\.[\pZ\t]*\[(.*?)\]\((\S+?)\)[\pZ\t]*$`)
 
 func ddgViaReader(ctx context.Context, client *http.Client, q string) ([]webResult, error) {
 	target := "https://lite.duckduckgo.com/lite/?q=" + url.QueryEscape(q)
 	body, err := get(ctx, client, readerBase+target, 512<<10, map[string]string{
-		"X-Return-Format": "text",
+		"X-Return-Format": "markdown",
 		"X-Retain-Images": "none",
 	})
 	if err != nil {
@@ -308,13 +397,13 @@ func ddgViaReader(ctx context.Context, client *http.Client, q string) ([]webResu
 		if i+1 < len(locs) {
 			end = locs[i+1][0]
 		}
-		r := webResult{Title: clean(text[loc[4]:loc[5]])}
+		r := webResult{Title: clean(text[loc[4]:loc[5]]), URL: resultURL(text[loc[6]:loc[7]])}
 		// Everything between this title and the next number is the snippet and the domain. The
 		// domain is the line with no spaces in it, which is what a host looks like and a sentence
 		// does not.
 		var snip []string
-		for _, line := range strings.Split(text[loc[5]:end], "\n") {
-			line = strings.TrimSpace(line)
+		for _, line := range strings.Split(text[loc[1]:end], "\n") {
+			line = strings.TrimSpace(strings.ReplaceAll(line, "**", ""))
 			if line == "" {
 				continue
 			}

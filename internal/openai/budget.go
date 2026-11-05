@@ -22,8 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -48,16 +46,48 @@ type Budget struct {
 	// for all of it. Checked against what was already spent alone, a $2 ceiling let the last
 	// session start at $1.99 and run to $2.49. Codex found it. Zero keeps the old check.
 	Reserve time.Duration
-	// admitted counts dials this process has passed through Check and not yet recorded with
-	// Opened or released with Abandon; each holds one Reserve against the ceiling.
-	admitted atomic.Int32
 }
+
+// hold is one dial that passed Check and has not yet been recorded by Opened or released by
+// Abandon. It lives in the FILE, under the same lock as the number it counts against: held in
+// memory, two processes on one machine (the bridge and a diagnostic share the default file)
+// each admitted a session with room for one. Muse found it.
+type hold struct {
+	PID int       `json:"pid"`
+	At  time.Time `json:"at"`
+}
+
+// holdFor is how long a hold is believed. A dial takes seconds; a process that died between
+// Check and Opened would otherwise block every later admission until tomorrow.
+const holdFor = 2 * time.Minute
 
 type budgetFile struct {
 	Day      string  `json:"day"`      // UTC date, YYYY-MM-DD
 	Seconds  float64 `json:"seconds"`  // connected seconds charged today
 	Sessions int     `json:"sessions"` // sessions opened today
 	Updated  string  `json:"updated"`
+	Holds    []hold  `json:"holds,omitempty"` // dials admitted and not yet opened or abandoned
+}
+
+// live keeps the holds that still mean something: recent, and owned by a process that exists.
+func (f *budgetFile) live(now time.Time) []hold {
+	var keep []hold
+	for _, h := range f.Holds {
+		if now.Sub(h.At) < holdFor && (h.PID == 0 || pidAlive(h.PID)) {
+			keep = append(keep, h)
+		}
+	}
+	return keep
+}
+
+// release drops one hold of this process, the oldest.
+func (f *budgetFile) release(pid int) {
+	for i, h := range f.Holds {
+		if h.PID == pid {
+			f.Holds = append(f.Holds[:i], f.Holds[i+1:]...)
+			return
+		}
+	}
 }
 
 // NewBudget opens (or creates) the shared counter. A limit of 0 disables enforcement but keeps
@@ -95,13 +125,13 @@ func (b *Budget) withLock(fn func(f *budgetFile) bool) error {
 
 	lock, err := os.OpenFile(b.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrBudgetUnreadable, err)
+		return fmt.Errorf("%w: %w", ErrBudgetUnreadable, err)
 	}
 	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("%w: %v", ErrBudgetUnreadable, err)
+	if err := lockFile(lock); err != nil {
+		return fmt.Errorf("%w: %w", ErrBudgetUnreadable, err)
 	}
-	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = unlockFile(lock) }()
 
 	var f budgetFile
 	raw, rerr := os.ReadFile(b.path)
@@ -115,7 +145,7 @@ func (b *Budget) withLock(fn func(f *budgetFile) bool) error {
 	case os.IsNotExist(rerr):
 		f = budgetFile{Day: today()}
 	default:
-		return fmt.Errorf("%w: %v", ErrBudgetUnreadable, rerr)
+		return fmt.Errorf("%w: %w", ErrBudgetUnreadable, rerr)
 	}
 	if f.Day != today() { // a new day starts at zero
 		f = budgetFile{Day: today()}
@@ -161,42 +191,51 @@ func (b *Budget) Check() error {
 		return nil
 	}
 	var spent float64
-	var sessions int
+	var sessions, inFlight int
+	// Dials admitted but not yet recorded count against the ceiling too. The check and the record
+	// are two file transactions with a network round trip between them, so two dials admitted
+	// together (a directive delivered twice, 1.17 s apart) both saw the same spend and both
+	// passed. The admission is written into the file, in the same transaction that read the
+	// spend, and released by Opened or Abandon.
+	worst := usd(b.Reserve.Seconds())
+	admitted := false
 	if err := b.withLock(func(f *budgetFile) bool {
-		spent, sessions = usd(f.Seconds), f.Sessions
-		return false
+		f.Holds = f.live(time.Now())
+		spent, sessions, inFlight = usd(f.Seconds), f.Sessions, len(f.Holds)
+		if b.limit <= 0 {
+			return false
+		}
+		if spent >= b.limit || spent+worst*float64(inFlight+1) > b.limit {
+			return false
+		}
+		f.Holds = append(f.Holds, hold{PID: os.Getpid(), At: time.Now()})
+		admitted = true
+		return true
 	}); err != nil {
 		b.ev("budget_unreadable", "err", err.Error(),
 			"note", "refusing to open a session while the spend counter cannot be read")
 		return err
 	}
-	if b.limit <= 0 {
+	if b.limit <= 0 || admitted {
 		return nil
 	}
-	// Dials this process has admitted but not yet recorded count against the ceiling too. The
-	// check and the record are two file transactions with a network round trip between them, so
-	// two dials admitted together (a directive delivered twice, 1.17 s apart) both saw the same
-	// spend and both passed. The admission is held in memory until Opened or Abandon releases it.
-	worst := usd(b.Reserve.Seconds())
-	inFlight := float64(b.admitted.Add(1))
-	if spent >= b.limit || spent+worst*inFlight > b.limit {
-		b.admitted.Add(-1)
-		b.ev("budget_exhausted", "spent_today_usd", spent, "limit_usd", b.limit,
-			"sessions_today", sessions, "next_session_could_cost_usd", worst, "dials_in_flight", inFlight-1,
-			"note", "no new GPT-Live session will be opened until tomorrow or the limit is raised")
-		return fmt.Errorf("%w: $%.3f of $%.2f used today across %d sessions, and the next could cost $%.2f",
-			ErrBudgetSpent, spent, b.limit, sessions, worst)
-	}
-	return nil
+	b.ev("budget_exhausted", "spent_today_usd", spent, "limit_usd", b.limit,
+		"sessions_today", sessions, "next_session_could_cost_usd", worst, "dials_in_flight", inFlight,
+		"note", "no new GPT-Live session will be opened until tomorrow or the limit is raised")
+	return fmt.Errorf("%w: $%.3f of $%.2f used today across %d sessions, and the next could cost $%.2f",
+		ErrBudgetSpent, spent, b.limit, sessions, worst)
 }
 
 // Abandon releases an admission whose session was never created. Opened releases the others.
 func (b *Budget) Abandon() {
-	if b == nil {
+	if b == nil || b.limit <= 0 {
 		return
 	}
-	if b.admitted.Add(-1) < 0 {
-		b.admitted.Store(0)
+	if err := b.withLock(func(f *budgetFile) bool {
+		f.release(os.Getpid())
+		return true
+	}); err != nil {
+		b.ev("budget_write_failed", "err", err.Error(), "note", "an admission could not be released; it expires on its own")
 	}
 }
 
@@ -208,10 +247,8 @@ func (b *Budget) Opened() error {
 	if b == nil {
 		return nil
 	}
-	if b.admitted.Add(-1) < 0 {
-		b.admitted.Store(0) // an Opened without a Check: a caller that never asked
-	}
 	if err := b.withLock(func(f *budgetFile) bool {
+		f.release(os.Getpid()) // an Opened without a Check releases nothing
 		f.Sessions++
 		f.Seconds += liveInitBilledSeconds
 		return true
@@ -249,9 +286,12 @@ func (b *Budget) Report() (spentUSD float64, sessions int) {
 	if b == nil {
 		return 0, 0
 	}
-	_ = b.withLock(func(f *budgetFile) bool {
+	if err := b.withLock(func(f *budgetFile) bool {
 		spentUSD, sessions = usd(f.Seconds), f.Sessions
 		return false
-	})
+	}); err != nil {
+		b.ev("budget_report_failed", "err", err.Error())
+		return 0, 0
+	}
 	return spentUSD, sessions
 }

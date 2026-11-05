@@ -107,6 +107,8 @@ type liveStartup struct {
 
 var errLiveStartupTimeout = errors.New("the session did not become ready")
 
+var errLegClosed = errors.New("the leg closed while starting")
+
 func newLiveStartup() *liveStartup {
 	return &liveStartup{pcConnected: make(chan struct{}), sessionStarted: make(chan struct{})}
 }
@@ -120,7 +122,7 @@ func (s *liveStartup) wait(ctx, legCtx context.Context, timeout time.Duration) e
 			return err
 		}
 		if legCtx.Err() != nil {
-			return errors.New("the leg closed while starting")
+			return errLegClosed
 		}
 		return nil
 	}
@@ -135,7 +137,7 @@ func (s *liveStartup) wait(ctx, legCtx context.Context, timeout time.Duration) e
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-legCtx.Done():
-			return errors.New("the leg closed while starting")
+			return errLegClosed
 		case <-t.C:
 			return errLiveStartupTimeout
 		}
@@ -485,6 +487,12 @@ func DialLive(
 			}
 		}
 		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					ev("live_sideband_panic_recovered", "panic", fmt.Sprint(p))
+					l.sidebandLive.Store(false)
+				}
+			}()
 			l.sidebandLive.Store(true)
 			for attempt := 0; ; attempt++ {
 				err := sb.Read(l.ctx, handle)
@@ -519,6 +527,11 @@ func DialLive(
 		// still being sent to the session is not idle, it is dead without saying so, and the
 		// reader above cannot tell: Read blocks. Closing the socket makes it return.
 		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					ev("live_stallwatch_panic_recovered", "panic", fmt.Sprint(p))
+				}
+			}()
 			t := time.NewTicker(2 * time.Second)
 			defer t.Stop()
 			var lastOut int64
@@ -549,6 +562,11 @@ func DialLive(
 
 	if cfg.MaxAge > 0 {
 		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					ev("live_maxage_panic_recovered", "panic", fmt.Sprint(p))
+				}
+			}()
 			select {
 			case <-l.ctx.Done():
 			case <-time.After(cfg.MaxAge):
@@ -572,7 +590,7 @@ func DialLive(
 		// starts are 2.8-3.7 s; twenty is not a limit anyone will meet by being slow.
 		ev("live_session_started_timeout", "note", "transport and session.started did not both arrive; hung up rather than billed")
 		l.Close("never_started")
-		return nil, errors.New("the session never started")
+		return nil, fmt.Errorf("the session never started: %w", errLiveStartupTimeout)
 	} else if ctx.Err() != nil {
 		l.Close("dial_cancelled")
 		return nil, ctx.Err()

@@ -129,7 +129,7 @@ func (s *Session) Connected() <-chan struct{} { return s.connected }
 // WriteAudio sends one Opus RTP packet toward the Echo. Used to forward OpenAI's speech.
 func (s *Session) WriteAudio(p *rtp.Packet) error {
 	if s.audioRTP == nil {
-		return errors.New("no outbound RTP track: Audio mode must be \"bridge\" or \"reflect\"")
+		return errors.New("no outbound RTP track: audio mode must be \"bridge\" or \"reflect\"")
 	}
 	if s.outPace != nil {
 		s.outPace.mark(p.Timestamp, p.Marker)
@@ -426,7 +426,6 @@ func Answer(id, offerSDP string, cfg Config, ev Events) (*Session, string, error
 	switch cfg.Video {
 	case "inactive", "recvonly":
 		_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
-		_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
 	case "sendonly", "sendrecv":
 		videoStream := cfg.VideoStreamID
 		if videoStream == "" {
@@ -694,7 +693,7 @@ func (s *Session) readAudio(tr *webrtc.TrackRemote, rc *webrtc.RTPReceiver) {
 	levelID := s.audioLevelID(rc)
 	var lastSeq uint16
 	var haveSeq bool
-	var gaps int64
+	var gaps, reorders int64
 	var levelSum, levelN int64
 	var voiceN int64
 	lastReport := time.Now()
@@ -716,8 +715,16 @@ func (s *Session) readAudio(tr *webrtc.TrackRemote, rc *webrtc.RTPReceiver) {
 		}
 		s.lastIn.Store(now)
 		s.inBytes.Add(int64(len(pkt.Payload)))
-		if haveSeq && pkt.SequenceNumber != lastSeq+1 {
-			gaps++
+		// A reorder (104 then 103) used to count as two gaps; only a forward jump lost packets,
+		// the rest is jitter, and the two are reported apart so a network that reorders is not
+		// "fixed" for a loss it does not have.
+		if haveSeq {
+			switch d := int16(pkt.SequenceNumber - lastSeq); {
+			case d > 1:
+				gaps++
+			case d <= 0:
+				reorders++
+			}
 		}
 		lastSeq, haveSeq = pkt.SequenceNumber, true
 		if levelID != 0 {
@@ -740,7 +747,7 @@ func (s *Session) readAudio(tr *webrtc.TrackRemote, rc *webrtc.RTPReceiver) {
 		}
 		if time.Since(lastReport) >= 5*time.Second {
 			lastReport = time.Now()
-			kv := []any{"pkts", s.inPkts.Load(), "bytes", s.inBytes.Load(), "seq_gaps", gaps}
+			kv := []any{"pkts", s.inPkts.Load(), "bytes", s.inBytes.Load(), "seq_gaps", gaps, "seq_reorders", reorders}
 			if levelN > 0 {
 				kv = append(kv, "avg_level_dbov", -float64(levelSum)/float64(levelN), "voice_frac", float64(voiceN)/float64(levelN))
 				levelSum, levelN, voiceN = 0, 0, 0
@@ -815,19 +822,40 @@ func (s *Session) startSenders() {
 			ssrc = uint32(params.Encodings[0].SSRC)
 		}
 		s.ev("local_sender", "kind", snd.Track().Kind().String(), "ssrc", ssrc, "codec", params.Codecs)
-		go s.readRTCP(snd, "sender")
+		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					s.ev("rtcp_panic_recovered", "panic", fmt.Sprint(p))
+				}
+			}()
+			s.readRTCP(snd, "sender")
+		}()
 	}
 	if s.audioSmp != nil && s.cfg.AudioFile != "" {
-		go playOggOpus(s.ctx, s.cfg.AudioFile, s.audioSmp, func(err error) { s.ev("audio_file_error", "err", err.Error()) })
+		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					s.ev("audio_file_panic_recovered", "panic", fmt.Sprint(p))
+				}
+			}()
+			playOggOpus(s.ctx, s.cfg.AudioFile, s.audioSmp, func(err error) { s.ev("audio_file_error", "err", err.Error()) })
+		}()
 	}
 	if s.videoSmp != nil && s.cfg.VideoFile != "" {
-		go playH264(s.ctx, s.cfg.VideoFile, s.cfg.VideoFPS, s.videoSmp, func(err error) { s.ev("video_file_error", "err", err.Error()) },
-			func(n, b int) {
-				s.vidFrames.Store(int64(n))
-				if n == 1 || n%30 == 0 {
-					s.ev("video_frame_sent", "n", n, "bytes", b)
+		go func() {
+			defer func() {
+				if p := recover(); p != nil {
+					s.ev("video_file_panic_recovered", "panic", fmt.Sprint(p))
 				}
-			})
+			}()
+			playH264(s.ctx, s.cfg.VideoFile, s.cfg.VideoFPS, s.videoSmp, func(err error) { s.ev("video_file_error", "err", err.Error()) },
+				func(n, b int) {
+					s.vidFrames.Store(int64(n))
+					if n == 1 || n%30 == 0 {
+						s.ev("video_frame_sent", "n", n, "bytes", b)
+					}
+				})
+		}()
 	}
 }
 

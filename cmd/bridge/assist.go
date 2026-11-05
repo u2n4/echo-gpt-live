@@ -13,7 +13,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -32,11 +31,17 @@ type transcriptWindow struct {
 	keep  time.Duration
 	buf   []windowPart
 	whole strings.Builder
-	taken time.Time // when the last question was handed out; the next one starts here
+	// taken is the ordinal of the last fragment handed out as a question; the next question
+	// starts after it. An ordinal, not a time: on a clock with coarse ticks (Windows: 0.5-15 ms)
+	// a fragment added in the same tick as the take read as older than it and came back in the
+	// next question, which is the "she answered my greeting again" fault by another road.
+	taken uint64
+	n     uint64 // fragments ever added to this call; each part carries its own
 }
 
 type windowPart struct {
 	at   time.Time
+	ord  uint64
 	text string
 }
 
@@ -59,7 +64,8 @@ func (w *transcriptWindow) add(text string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now := time.Now()
-	w.buf = append(w.buf, windowPart{at: now, text: text})
+	w.n++
+	w.buf = append(w.buf, windowPart{at: now, ord: w.n, text: text})
 	cut := now.Add(-w.keep)
 	for len(w.buf) > 0 && w.buf[0].at.Before(cut) {
 		w.buf = w.buf[1:]
@@ -83,16 +89,19 @@ func (w *transcriptWindow) add(text string) {
 func (w *transcriptWindow) question() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	from := w.taken
-	if from.IsZero() {
-		// The first question of a call reaches back only as far as a question can be long. The
-		// whole window reached back to his greeting, which the first delegation then answered as
-		// if it were part of the question. Grok found it.
-		from = time.Now().Add(-firstQuestionReach)
+	// The first question of a call reaches back only as far as a question can be long. The whole
+	// window reached back to his greeting, which the first delegation then answered as if it were
+	// part of the question. Grok found it.
+	cut := time.Now().Add(-firstQuestionReach)
+	var b strings.Builder
+	for _, p := range w.buf {
+		if p.ord <= w.taken || (w.taken == 0 && p.at.Before(cut)) {
+			continue
+		}
+		b.WriteString(p.text)
+		w.taken = p.ord
 	}
-	q := w.sinceLocked(from)
-	w.taken = time.Now()
-	return q
+	return strings.TrimSpace(b.String())
 }
 
 // since returns only what was said after a given moment, which is how a spoken confirmation is told
@@ -118,12 +127,23 @@ func (w *transcriptWindow) sinceLocked(t time.Time) string {
 	return strings.TrimSpace(b.String())
 }
 
+// lastAt is when the most recent fragment of his speech arrived: the moment his goodbye was
+// heard, for a goodbye the model understood a round later.
+func (w *transcriptWindow) lastAt() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.buf) == 0 {
+		return time.Time{}
+	}
+	return w.buf[len(w.buf)-1].at
+}
+
 func (w *transcriptWindow) reset() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.buf = nil
 	w.whole.Reset()
-	w.taken = time.Time{}
+	w.taken, w.n = 0, 0
 }
 
 // whole is everything he said during THIS call. The rolling window answers "what is he asking
@@ -180,7 +200,22 @@ type assistant struct {
 	// refresh rebuilds the router's context (place, time, memory) after something in it changed
 	// mid-call - a fact he just asked to remember, for instance. Set by the bridge.
 	refresh func()
+	// hangUp ends the call after a goodbye the model understood, timed from when he said it. Set
+	// by the bridge to arm the same farewell the phrase match uses; nil when farewells are off.
+	// It reports whether the goodbye was new: a phrase match may have heard, and answered, the
+	// same words already.
+	hangUp func(at time.Time) bool
+
+	// confirmMu guards confirmTimer only; the permission itself lives in pendingWrite.
+	confirmMu    sync.Mutex
+	confirmTimer *time.Timer
 }
+
+// confirmQuiet is how long a heard yes waits for the rest of its utterance. The transcript
+// arrives in fragments, and acting on the first yes-shaped one executed the write before the
+// "no" in the same breath had landed. A refusal is acted on the moment it is heard; only the
+// yes waits. Muse found it.
+const confirmQuiet = 800 * time.Millisecond
 
 // newCall starts a fresh conversation. Nothing said before it and nothing agreed to before it
 // carries over: this object outlives every call, and permission that outlives the call that granted
@@ -200,6 +235,7 @@ func (a *assistant) newCall(id string) {
 
 	a.window.reset()
 	a.pending.clear()
+	a.stopConfirm()
 }
 
 // setSpeaker gives the call its control socket, once the OpenAI leg is up.
@@ -241,6 +277,21 @@ func (a *assistant) endCall() {
 	}
 	a.call = ""
 	a.pending.clear()
+	a.stopConfirm()
+}
+
+// setRefresh installs the per-call context rebuild under the same lock as every other field of
+// the call: attachLive writes it while a settle on another goroutine may read it.
+func (a *assistant) setRefresh(fn func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.refresh = fn
+}
+
+func (a *assistant) refresher() func() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.refresh
 }
 
 // current returns the live call's context and id. A zero id means there is no call, and a
@@ -269,20 +320,68 @@ func (a *assistant) onTranscript(text string) {
 		return
 	}
 	said := listen(a.window.since(at))
-	if said == heardNothing {
+	switch said {
+	case heardNothing:
+		return
+	case heardNo:
+		// Final the moment it is heard: a yes still waiting out its quiet window is dropped.
+		a.stopConfirm()
+		a.act(ctx, call, said)
+	default:
+		// A yes waits for the rest of its utterance; the words are read again when it fires.
+		a.deferConfirm(ctx, call, at)
+	}
+}
+
+// act spends the permission on what was heard. The speaker is checked BEFORE the permission is
+// consumed: with no control socket there is nothing to run into, and his yes stays armed for
+// the delegation the model will raise about it.
+func (a *assistant) act(ctx context.Context, call string, said heard) {
+	sp := a.speakerFor(call)
+	if sp == nil {
+		a.ev("confirmation_unspeakable", "note", "no control socket for this call; the permission stays armed")
 		return
 	}
 	tool, args, _, deleg, taken := a.pending.take(call, a.confirmWithin)
 	if !taken {
 		return // a delegation about the same yes got there first
 	}
-	sp := a.speakerFor(call)
-	if sp == nil {
-		a.ev("confirmation_unspeakable", "tool", tool, "note", "no control socket for this call")
-		return
-	}
 	// Off the transcript thread: a write can take seconds, and the next fragment must not wait.
 	go a.settle(ctx, sp, deleg, tool, args, said)
+}
+
+// stopConfirm drops a yes waiting out its quiet window. The permission stays armed; only the
+// timer goes.
+func (a *assistant) stopConfirm() {
+	a.confirmMu.Lock()
+	defer a.confirmMu.Unlock()
+	if a.confirmTimer != nil {
+		a.confirmTimer.Stop()
+		a.confirmTimer = nil
+	}
+}
+
+// deferConfirm (re)starts the quiet window for a heard yes. A second yes fragment restarts it
+// rather than stacking, so the take at fire time runs once. At fire time the words since the
+// proposal are read again: a refusal that arrived late wins, a continuation that is no longer a
+// whole yes leaves the permission armed and untouched.
+func (a *assistant) deferConfirm(ctx context.Context, call string, at time.Time) {
+	a.confirmMu.Lock()
+	defer a.confirmMu.Unlock()
+	if a.confirmTimer != nil {
+		a.confirmTimer.Stop()
+	}
+	a.confirmTimer = time.AfterFunc(confirmQuiet, func() {
+		a.confirmMu.Lock()
+		a.confirmTimer = nil
+		a.confirmMu.Unlock()
+		if ctx.Err() != nil {
+			return // the call ended inside the window
+		}
+		if said := listen(a.window.since(at)); said != heardNothing {
+			a.act(ctx, call, said)
+		}
+	})
 }
 
 // settle runs, or declines to run, the one write he was asked about, and says what happened.
@@ -297,9 +396,11 @@ func (a *assistant) settle(ctx context.Context, sp speaker, deleg, tool, args st
 	if err != nil {
 		a.ev("delegation_write_failed", "tool", tool, "err", err.Error())
 		out = spokenFailed + err.Error()
-	} else if tool == "remember" && a.refresh != nil {
+	} else if tool == "remember" {
 		// What she knows about him changed a second ago; the next question should know it too.
-		a.refresh()
+		if refresh := a.refresher(); refresh != nil {
+			refresh()
+		}
 	}
 	a.say(ctx, sp, deleg, out)
 }
@@ -365,23 +466,54 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 	}
 	if question == "" {
 		a.ev("delegation_no_question", "note", "a delegation arrived with nothing said before it")
-		_ = sb.Thinking(ctx, delegationID, spokenNoQuestion)
+		if err := sb.Thinking(ctx, delegationID, spokenNoQuestion); err != nil {
+			a.ev("delegation_send_failed", "err", err.Error())
+		}
 		return
 	}
 
 	a.ev("delegation_start", "id", delegationID, "chars", len(question))
 	t0 := time.Now()
 
-	// The previous exchange of this call rides along, so a follow-up has something to follow. The
-	// question is still only what he just said; the router had no idea what "and tomorrow?" meant.
-	prompt := question
-	if q, ans := a.previous(); q != "" {
-		prompt = fmt.Sprintf("Earlier in this same call he asked: %q and was told: %q. Now he says: %s",
-			clipRunes(q, 200), clipRunes(ans, 300), question)
+	// A question about the world takes a search and a page: 5-9 s measured. The voice model was
+	// told to say "one moment" and on the 17:24 call it never did - three questions, 4-6 s of
+	// dead air each before her answer. So the bridge says it, at once, for the questions that
+	// will take a while. Two words, and only when the words call for a search.
+	if tools.WorldCue(question) {
+		a.say(ctx, sb, delegationID, spokenLooking)
 	}
 
-	answer, err := a.answerer.Answer(ctx, prompt)
+	// The previous exchange of this call rides along, so a follow-up has something to follow. The
+	// question is still only what he just said; the router had no idea what "and tomorrow?" meant.
+	ask := openai.Question{Said: question}
+	ask.PrevQ, ask.PrevA = a.previous()
+
+	answer, err := a.answerer.Answer(ctx, ask)
 	if err != nil {
+		var ending *tools.ErrCallEnding
+		if errors.As(err, &ending) {
+			// He said goodbye in his own words and the model understood it. The goodbye is timed
+			// from his last words, not from this round, so the wait for her reply is not
+			// lengthened by the time it took to understand him.
+			a.ev("delegation_ends_call", "ms", time.Since(t0).Milliseconds())
+			// Spoken, not merely known. The voice model was told to say goodbye itself and then
+			// ask for help; on the 17:24 call it asked and said nothing, so he heard silence for
+			// six seconds and then the line dropped. Her goodbye comes from the bridge - once:
+			// when the phrase match already heard these words it has already answered them, and
+			// this delegation about the same goodbye says nothing more. Muse found the double.
+			fresh := a.hangUp == nil
+			if a.hangUp != nil {
+				at := a.window.lastAt()
+				if at.IsZero() || at.After(t0) {
+					at = t0
+				}
+				fresh = a.hangUp(at)
+			}
+			if fresh {
+				a.say(ctx, sb, delegationID, spokenGoodbye)
+			}
+			return
+		}
 		var need *tools.ErrNeedsConfirmation
 		if errors.As(err, &need) {
 			old := a.pending.arm(call, need.Tool, need.Args, need.What, delegationID)
@@ -392,12 +524,12 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 				ask = spokenSupersedes + ask
 			}
 			a.ev("delegation_asks_permission", "tool", need.Tool, "supersedes", old)
-			_ = sb.Commentary(ctx, delegationID, ask)
+			a.say(ctx, sb, delegationID, ask)
 			return
 		}
 		a.ev("delegation_failed", "err", err.Error(), "ms", time.Since(t0).Milliseconds())
 		// Say something rather than leave him listening to nothing.
-		_ = sb.Commentary(ctx, delegationID, spokenCouldNotFind)
+		a.say(ctx, sb, delegationID, spokenCouldNotFind)
 		return
 	}
 
@@ -406,16 +538,9 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 	answer = spoken(answer, spokenCap)
 	a.remember(question, answer)
 	a.ev("delegation_answered", "ms", time.Since(t0).Milliseconds(), "chars", len(answer))
-	if err := sb.Commentary(ctx, delegationID, answer); err != nil {
-		a.ev("delegation_send_failed", "err", err.Error())
-	}
-}
-
-func clipRunes(s string, n int) string {
-	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "…"
-	}
-	return s
+	// Through say: a delegation that already carried the "one moment" may or may not still be
+	// accepting, and the answer must reach the room either way.
+	a.say(ctx, sb, delegationID, answer)
 }
 
 // spokenCap is how much one answer may say out loud. 300 characters of Arabic is about two
@@ -456,4 +581,7 @@ const (
 	spokenDeclined      = "تمام، ما بسويها."
 	spokenFailed        = "ما زبطت: "
 	spokenSupersedes    = "خلاص نسينا الطلب الأول. "
+	spokenGoodbye       = "مع السلامة."
+	spokenLooking       = "ثواني، أشوف لك."
+	spokenHello         = "هلا."
 )
