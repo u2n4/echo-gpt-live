@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Sync this repo (minus .git/runs) to the Ubuntu build host and build both binaries.
-# Usage: scripts/sync.sh [host]   (default host: bridge-host)
+# Usage: scripts/sync.sh <ssh-host>
 set -euo pipefail
-HOST="${1:-bridge-host}"
+HOST="${1:?usage: scripts/sync.sh <ssh-host>}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 tar --exclude=.git --exclude=runs --exclude=bin --exclude='*.pcap' -cf - . | \
