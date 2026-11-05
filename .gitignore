@@ -9,6 +9,8 @@ dist/
 *.exe
 # logs & captures
 logs/
+traces/
+.tmp/
 *.pcap
 *.pcapng
 runs/
