@@ -32,6 +32,14 @@ const (
 	maxBody  = 64 * 1024
 )
 
+// Sentinel auth failures. Wire strings stay byte-stable for the Lambda;
+// match with errors.Is, never with err.Error() ==.
+var (
+	ErrBadTimestamp = errors.New("bad_timestamp")
+	ErrStale        = errors.New("stale")
+	ErrBadSignature = errors.New("bad_signature")
+)
+
 // Request is the decoded signaling body.
 type Request struct {
 	V         int     `json:"v"`
@@ -73,17 +81,17 @@ func (s *Server) event(ev string, kv ...any) {
 func (s *Server) verify(ts string, body []byte, sig string) error {
 	tsf, err := strconv.ParseFloat(ts, 64)
 	if err != nil {
-		return errors.New("bad_timestamp")
+		return ErrBadTimestamp
 	}
 	if d := time.Since(time.Unix(0, int64(tsf*1e9))); d > tsWindow || d < -tsWindow {
-		return errors.New("stale")
+		return ErrStale
 	}
 	mac := hmac.New(sha256.New, s.key)
 	mac.Write([]byte(ts + "."))
 	mac.Write(body)
 	want := hex.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(want), []byte(strings.ToLower(sig))) {
-		return errors.New("bad_signature")
+		return ErrBadSignature
 	}
 	return nil
 }
@@ -104,52 +112,70 @@ func (s *Server) seenNonce(n string) bool {
 	return false
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	b, _ := json.Marshal(v)
+func (s *Server) writeJSON(w http.ResponseWriter, code int, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		s.event("signaling_write_failed", "code", code, "err", err.Error())
+		http.Error(w, "internal", 500)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_, _ = w.Write(b)
+	if _, err := w.Write(b); err != nil {
+		s.event("signaling_write_failed", "code", code, "err", err.Error())
+	}
 }
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	method := r.Method
+	t0 := time.Now()
+	status := 0
+	defer func() {
+		s.event("http_access", "method", method, "path", path, "status", status,
+			"latency_ms", time.Since(t0).Milliseconds())
+	}()
+	reply := func(code int, v any) {
+		status = code
+		s.writeJSON(w, code, v)
+	}
 	if r.Method == http.MethodGet && path == "/health" {
-		writeJSON(w, 200, map[string]any{"ok": true, "service": "rtcdiag"})
+		reply(200, map[string]any{"ok": true, "service": "rtcdiag"})
 		return
 	}
 	if r.Method != http.MethodPost || (path != "/rtc/offer" && path != "/rtc/connected" && path != "/rtc/disconnected") {
-		writeJSON(w, 404, map[string]any{"error": "not_found"})
+		reply(404, map[string]any{"error": "not_found"})
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil || len(body) > maxBody {
-		writeJSON(w, 413, map[string]any{"error": "too_large"})
+		reply(413, map[string]any{"error": "too_large"})
 		return
 	}
 	ts, sig := r.Header.Get("X-ACV-Timestamp"), r.Header.Get("X-ACV-Signature")
 	if ts == "" || sig == "" {
-		writeJSON(w, 401, map[string]any{"error": "missing_auth"})
+		reply(401, map[string]any{"error": "missing_auth"})
 		return
 	}
 	if err := s.verify(ts, body, sig); err != nil {
 		s.event("signaling_auth_fail", "path", path, "reason", err.Error())
 		code := 401
-		if err.Error() == "bad_signature" {
+		if errors.Is(err, ErrBadSignature) {
 			code = 403
 		}
-		writeJSON(w, code, map[string]any{"error": err.Error()})
+		reply(code, map[string]any{"error": err.Error()})
 		return
 	}
 	var req Request
 	if err := json.Unmarshal(body, &req); err != nil || req.SessionID == "" {
-		writeJSON(w, 400, map[string]any{"error": "bad_json"})
+		reply(400, map[string]any{"error": "bad_json"})
 		return
 	}
 	// The session id names a run directory and a recording directory downstream. Alexa's ids
 	// are UUIDs; anything with a path separator, a dot run or a control character is not one.
 	if !plainID(req.SessionID) {
-		writeJSON(w, 400, map[string]any{"error": "bad_session_id"})
+		reply(400, map[string]any{"error": "bad_session_id"})
 		return
 	}
 	nonce := req.Nonce
@@ -157,34 +183,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		nonce = sig
 	}
 	if s.seenNonce(nonce) {
-		writeJSON(w, 409, map[string]any{"error": "replay"})
+		reply(409, map[string]any{"error": "replay"})
 		return
 	}
 	// Lambda-side send time vs our receive time: measures Lambda->Funnel->us latency.
 	lambdaTS := time.Unix(0, int64(req.TS*1e9))
-	s.event("signaling_rx", "path", path, "sessionId", req.SessionID, "lambda_to_us_ms", time.Since(lambdaTS).Milliseconds(), "body_bytes", len(body))
+	s.event("signaling_rx", "method", method, "path", path, "sessionId", req.SessionID, "lambda_to_us_ms", time.Since(lambdaTS).Milliseconds(), "body_bytes", len(body))
 
 	switch path {
 	case "/rtc/offer":
 		if !strings.Contains(req.SDP, "v=0") {
-			writeJSON(w, 400, map[string]any{"error": "bad_sdp"})
+			reply(400, map[string]any{"error": "bad_sdp"})
 			return
 		}
-		t0 := time.Now()
+		t1 := time.Now()
 		answer, err := s.h.Offer(req.SessionID, req.SDP)
 		if err != nil {
-			s.event("answer_failed", "sessionId", req.SessionID, "err", err.Error(), "ms", time.Since(t0).Milliseconds())
-			writeJSON(w, 502, map[string]any{"v": 1, "type": "error", "sessionId": req.SessionID, "code": "ANSWER_FAILED", "message": err.Error()})
+			s.event("answer_failed", "sessionId", req.SessionID, "err", err.Error(), "ms", time.Since(t1).Milliseconds())
+			reply(502, map[string]any{"v": 1, "type": "error", "sessionId": req.SessionID, "code": "ANSWER_FAILED", "message": err.Error()})
 			return
 		}
-		s.event("answer_sent", "sessionId", req.SessionID, "answer_ms", time.Since(t0).Milliseconds(), "answer_bytes", len(answer))
-		writeJSON(w, 200, map[string]any{"v": 1, "type": "answer", "sessionId": req.SessionID, "sdp": answer})
+		s.event("answer_sent", "sessionId", req.SessionID, "answer_ms", time.Since(t1).Milliseconds(), "answer_bytes", len(answer))
+		reply(200, map[string]any{"v": 1, "type": "answer", "sessionId": req.SessionID, "sdp": answer})
 	case "/rtc/connected":
 		s.h.Connected(req.SessionID)
-		writeJSON(w, 200, map[string]any{"ok": true})
+		reply(200, map[string]any{"ok": true})
 	case "/rtc/disconnected":
 		s.h.Disconnected(req.SessionID)
-		writeJSON(w, 200, map[string]any{"ok": true})
+		reply(200, map[string]any{"ok": true})
 	}
 }
 

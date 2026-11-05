@@ -228,7 +228,9 @@ func main() {
 	}
 	shctx, c := context.WithTimeout(context.Background(), 3*time.Second)
 	defer c()
-	_ = hs.Shutdown(shctx)
+	if err := hs.Shutdown(shctx); err != nil {
+		a.ev("http_shutdown_failed", "err", err.Error())
+	}
 	a.ev("rtcdiag_stop")
 }
 

@@ -182,10 +182,12 @@ func (c *LiveClient) Warm(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, _ = io.Copy(io.Discard, res.Body)
-	res.Body.Close()
+	defer res.Body.Close()
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		c.event("live_warm_drain_failed", "err", err.Error())
+	}
 	if res.StatusCode >= 400 {
-		return fmt.Errorf("HTTP %d", res.StatusCode)
+		return fmt.Errorf("warm: %w", &StatusError{Op: "warm", Status: res.StatusCode})
 	}
 	return nil
 }
@@ -221,7 +223,8 @@ type liveCreateResponse struct {
 // StorageDenied reports whether an error is the project refusing stored sessions. A project with
 // data persistence disabled (or Zero Data Retention) rejects store:true, and fork depends on it.
 func StorageDenied(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "session_storage_not_allowed")
+	var ae *apiError
+	return err != nil && errors.As(err, &ae) && ae.Code == "session_storage_not_allowed"
 }
 
 // AudioInputDenied reports the API refusing session.audio.input.
@@ -235,8 +238,9 @@ func StorageDenied(err error) bool {
 // not: gpt-live-1 listens continuously rather than through an input buffer with turn detection, so
 // there is no input buffer to filter or segment. Only audio.output is accepted.
 func AudioInputDenied(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "unknown_parameter") &&
-		strings.Contains(err.Error(), "session.audio.input")
+	var ae *apiError
+	return err != nil && errors.As(err, &ae) && ae.Code == "unknown_parameter" &&
+		strings.Contains(ae.Message, "session.audio.input")
 }
 
 // CreateSession posts the SDP offer and returns the answer plus the opaque session id.
@@ -279,7 +283,7 @@ func (c *LiveClient) ForkAvailable() bool { return !c.storeDenied.Load() }
 
 func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSessionConfig) (*LiveSession, error) {
 	if c.APIKey == "" {
-		return nil, errors.New("no OpenAI API key")
+		return nil, ErrNoAPIKey
 	}
 	if cfg.Model == "" {
 		cfg.Model = c.Model
@@ -334,22 +338,28 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 		return nil, fmt.Errorf("create live session: %w", err)
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("create live session: %w", err)
+	}
 	c.event("live_create_session", "status", res.StatusCode, "ms", time.Since(t0).Milliseconds(),
 		"billed_init_seconds", liveInitBilledSeconds, "bytes", len(raw))
 	var out liveCreateResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("create live session: HTTP %d, unparseable body: %s", res.StatusCode, truncate(string(raw), 300))
+		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	if res.StatusCode != http.StatusCreated && res.StatusCode != http.StatusOK {
-		msg := truncate(string(raw), 400)
 		if out.Error != nil {
-			msg = out.Error.Code + ": " + out.Error.Message
+			return nil, fmt.Errorf("create live session: %w", &apiError{
+				Code:    out.Error.Code,
+				Message: out.Error.Message,
+				Type:    out.Error.Type,
+			})
 		}
-		return nil, fmt.Errorf("create live session: HTTP %d: %s", res.StatusCode, msg)
+		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	if out.Session.ID == "" || out.Transport.SDP == "" {
-		return nil, fmt.Errorf("create live session: missing session.id or transport.sdp in response: %s", truncate(string(raw), 300))
+		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	// Count the money the moment it is committed, not when the session closes: a process that dies
 	// in between must still leave the cost on the record.
@@ -571,7 +581,11 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 	if err := c.Budget.Check(); err != nil {
 		return nil, err
 	}
-	body, _ := json.Marshal(map[string]any{"transport": map[string]any{"type": "webrtc", "sdp": offerSDP}})
+	body, err := json.Marshal(map[string]any{"transport": map[string]any{"type": "webrtc", "sdp": offerSDP}})
+	if err != nil {
+		c.Budget.Abandon()
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, liveURL+"/"+sourceID+"/fork", bytes.NewReader(body))
 	if err != nil {
 		c.Budget.Abandon()
@@ -585,7 +599,11 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 		return nil, err
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		c.Budget.Abandon()
+		return nil, fmt.Errorf("fork: %w", err)
+	}
 	c.event("live_fork", "status", res.StatusCode, "source", sourceID, "bytes", len(raw))
 	var out liveCreateResponse
 	// A 4xx with a well-formed error body parses fine and has no session id; a 2xx with no
@@ -597,9 +615,18 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 				"action", "hanging up: created without an answer")
 			hctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			_ = c.HangupRetry(hctx, out.Session.ID, 3)
+			if herr := c.HangupRetry(hctx, out.Session.ID, 3); herr != nil {
+				c.event("live_fork_cleanup_failed", "session_id", out.Session.ID, "err", herr.Error())
+			}
 		}
-		return nil, fmt.Errorf("fork: HTTP %d: %s", res.StatusCode, truncate(string(raw), 300))
+		if out.Error != nil {
+			return nil, fmt.Errorf("fork: %w", &apiError{
+				Code:    out.Error.Code,
+				Message: out.Error.Message,
+				Type:    out.Error.Type,
+			})
+		}
+		return nil, fmt.Errorf("fork: %w", &StatusError{Op: "fork", Status: res.StatusCode})
 	}
 	if err := c.recordOpened(out.Session.ID); err != nil {
 		return nil, err
@@ -621,10 +648,13 @@ func (c *LiveClient) post(ctx context.Context, path string, body []byte, ev stri
 		return err
 	}
 	defer res.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
-	c.event(ev, "status", res.StatusCode, "body", truncate(string(b), 200))
+	b, err := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+	if err != nil {
+		return fmt.Errorf("%s: %w", ev, err)
+	}
+	c.event(ev, "status", res.StatusCode, "body_chars", len(b))
 	if res.StatusCode >= 300 {
-		return fmt.Errorf("%s: HTTP %d: %s", ev, res.StatusCode, truncate(string(b), 200))
+		return fmt.Errorf("%s: %w", ev, &StatusError{Op: ev, Status: res.StatusCode})
 	}
 	return nil
 }

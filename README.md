@@ -3,7 +3,7 @@
 Turn an Amazon Echo into the microphone and speaker of an OpenAI **gpt-live-1** voice session.
 Say "Alexa, call Sol", and a full-duplex WebRTC call runs between the Echo and OpenAI with this
 Go bridge in the middle: Opus audio forwarded verbatim both ways, transcripts on a control
-socket, a cheap router model for tools (web search, weather, notes, memory), and hard money
+socket, a cheap router model for tools (web search, weather, prayer times, notes, memory), and hard money
 guards because gpt-live-1 bills every minute the line is open.
 
 Everything in this repository was measured on a real Echo Dot 5 over 28+ calls; the numbers in
@@ -35,11 +35,16 @@ Echo Dot ──(Alexa cloud)──► AWS Lambda (lambda/index.mjs)
   moment the session is ready, so the first words are not lost.
 - A 1 fps black H.264 stream keeps Amazon's camera-category session alive (Amazon tears a
   session down after 26-28 s without video).
-- Questions that need the outside world are delegated by the voice model to a cheap router
-  model (`gpt-5-nano`) that can call tools: free web search, weather, host status, today's
-  spend, notes on your PC (via `cmd/vaultd`), and a plain-text memory file.
-- Goodbye phrases end the call; idle, a maximum call length and a daily budget end it too. A
-  ledger of open OpenAI sessions on disk lets a restarted process close what a crashed one left.
+- Questions that need the outside world are delegated by the voice model to a router model
+  (`gpt-4.1-mini`, `--search-model`) that can call tools: free web search, opening a page the
+  search found (`open_result`, by result number only, never by address), weather, prayer times,
+  host status, today's spend, notes on your PC (via `cmd/vaultd`), and a plain-text memory file. When the
+  words call for it (a price, a score, the news) the search runs before the router is asked, so
+  the first round already has results. `cmd/answertest` measures this path without a call.
+- Goodbye phrases end the call, and so does a goodbye in any other words: the router has an
+  `end_call` tool, guarded by a check that the words really contain a farewell. Idle, a maximum
+  call length and a daily budget end it too. A ledger of open OpenAI sessions on disk lets a
+  restarted process close what a crashed one left.
 
 ## What you need
 
@@ -119,8 +124,10 @@ beside the live bridge on 8787, because a simulator that reaches the live assist
 - `--daily-budget-usd`: refuses to open a session once today's spend (counted on disk per UTC
   day, `--budget-file`) plus one maximum call would pass the limit.
 - `--max-live` (10 min default) and `--idle-close` (silence, driven by the transcript) hang up.
-- Goodbye: built-in Arabic and English phrases, `--farewell` to change. The transport is dropped
-  after she finishes her goodbye; Alexa ends the Echo's session 6-8 s later.
+- Goodbye: built-in Arabic and English phrases, `--farewell` to change, plus the router's
+  `end_call` for a goodbye said in other words (it refuses words with no farewell in them, so
+  "خلاص" or "thanks" alone never hang up). The transport is dropped after she finishes her
+  goodbye; Alexa ends the Echo's session 6-8 s later.
 - The ledger (`--ledger`) records every open OpenAI session with its start time and pid. A sweep
   runs every 5 minutes and at shutdown; a restarted process closes sessions a crashed one left.
 - The test tools hang up on exit and never bind the live port.
@@ -149,7 +156,7 @@ cmd/vaultd       tiny HTTP agent that serves your notes folder to the bridge (se
 cmd/rtcdiag      the original Echo-side experiment harness
 internal/bridge  Pion peer for the Echo (peer.go), the OpenAI leg (liveleg.go), hold/pacer/sequence rebase, farewell detector, recording
 internal/openai  live session client, sideband websocket, budget, ledger, router model
-internal/tools   web search, weather, host status, spend, notes, memory tools
+internal/tools   web search, weather, prayer times, host status, spend, notes, memory tools
 internal/memory  the plain-text memory file
 internal/alexa   HMAC-signed signaling server
 lambda/          the Alexa Smart Home Lambda and its deploy script

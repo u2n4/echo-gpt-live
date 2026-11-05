@@ -26,20 +26,22 @@ const liteFixture = `<html><body><table>
 <tr><td>&nbsp;</td><td><span class='link-text'>nosnippet.example</span></td></tr>
 </table></body></html>`
 
-// What the reader returns for the same search, in plain-text mode: a nav block with no numbers,
-// then numbered results whose last unspaced line is the visible domain.
-const readerFixture = `
-DuckDuckGo
-All Regions
-Saudi Arabia
-Any Time
-Past Day
+// What the reader returns for the same search, in markdown mode (a trimmed copy from 16 September
+// 2026): a nav block with no numbers, then numbered results whose title is a link through the
+// engine's redirect, a bolded snippet, and the visible domain as the last unspaced line.
+const readerFixture = `Title: ذهب at DuckDuckGo
 
-1. 	أسعار الذهب اليوم في السعودية
-   	أسعار الذهب اليوم في السعودية بالريال السعودي لحظة بلحظة.
-   	drhint.com/ar/gold-rate-saudi-arabia
-2. 	Gold Price in Saudi Arabia
-   	livepriceofgold.com/saudi-arabia-gold-price.html
+URL Source: https://lite.duckduckgo.com/lite/?q=ذهب
+
+Markdown Content:
+DuckDuckGo
+
+1.[أسعار الذهب اليوم في السعودية](https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdrhint.com%2Far%2Fgold%2Drate%2Dsaudi%2Darabia&rut=abc)
+**أسعار** الذهب اليوم في السعودية بالريال السعودي لحظة بلحظة.
+drhint.com/ar/gold-rate-saudi-arabia
+
+2.[Gold Price in Saudi Arabia](https://duckduckgo.com/l/?uddg=https%3A%2F%2Flivepriceofgold.com%2Fsaudi%2Darabia%2Dgold%2Dprice.html&rut=def)
+livepriceofgold.com/saudi-arabia-gold-price.html
 `
 
 func TestDDGLiteParse(t *testing.T) {
@@ -96,8 +98,8 @@ func TestDDGBlockedIsNotEmpty(t *testing.T) {
 
 func TestReaderParse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Return-Format") != "text" {
-			t.Errorf("the reader needs to be asked for text, got %q", r.Header.Get("X-Return-Format"))
+		if r.Header.Get("X-Return-Format") != "markdown" {
+			t.Errorf("the reader needs to be asked for markdown, which carries the links; got %q", r.Header.Get("X-Return-Format"))
 		}
 		_, _ = w.Write([]byte(readerFixture))
 	}))
@@ -129,6 +131,13 @@ func TestReaderParse(t *testing.T) {
 	}
 	if got[1].Where != "livepriceofgold.com/saudi-arabia-gold-price.html" {
 		t.Errorf("result 2 domain: %q", got[1].Where)
+	}
+	// The address is decoded out of the engine's redirect, because that is what open_result reads.
+	if got[0].URL != "https://drhint.com/ar/gold-rate-saudi-arabia" {
+		t.Errorf("result 1 url: %q", got[0].URL)
+	}
+	if got[1].URL != "https://livepriceofgold.com/saudi-arabia-gold-price.html" {
+		t.Errorf("result 2 url: %q", got[1].URL)
 	}
 	// The navigation above the results has no numbers and must not become a result.
 	for _, r := range got {

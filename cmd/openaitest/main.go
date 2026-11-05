@@ -207,7 +207,10 @@ func main() {
 			var env struct {
 				Type string `json:"type"`
 			}
-			_ = json.Unmarshal(msg.Data, &env)
+			if err := json.Unmarshal(msg.Data, &env); err != nil {
+				lg.Event("live_dc_parse_error", "bytes", len(msg.Data))
+				return
+			}
 			lg.Event("live_dc_event", "type", env.Type, "bytes", len(msg.Data))
 			// the docs say to wait for session.started before sending application commands
 			if env.Type == "session.started" {
@@ -316,7 +319,16 @@ func main() {
 			os.Exit(1)
 		}
 		sessionID, answerSDP = ls.ID, ls.Answer
-		hangupFn = func() { _ = lc.Hangup(context.Background(), ls.ID) }
+		opened := time.Now()
+		hangupFn = func() {
+			if err := lc.Hangup(context.Background(), ls.ID); err != nil {
+				lg.Event("openaitest_hangup_failed", "session_id", ls.ID, "err", err.Error())
+				fmt.Fprintln(os.Stderr, "hangup:", err)
+			}
+			// The day's counter is shared with the bridge; a test session that only recorded its
+			// init charge undercounted every minute it stayed open. Muse found it.
+			lc.Budget.Spent(time.Since(opened))
+		}
 		if serr := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); serr != nil {
 			lg.Event("set_remote_failed", "err", serr.Error())
 			fmt.Fprintln(os.Stderr, "set remote:", serr)
@@ -327,11 +339,21 @@ func main() {
 			// not fatal: the data channel still carries events
 			lg.Event("live_attach_failed", "err", aerr.Error())
 		} else {
-			defer sb.Close()
+			defer func() {
+				if err := sb.Close(); err != nil {
+					lg.Event("live_sideband_close_failed", "err", err.Error())
+				}
+			}()
 			go func() {
-				_ = sb.Read(ctx, func(typ string, raw []byte) {
+				if err := sb.Read(ctx, func(typ string, raw []byte) {
+					if strings.Contains(typ, "transcript") || strings.Contains(typ, "text") || strings.Contains(typ, "delta") {
+						lg.Event("live_sideband_event", "type", typ, "chars", len(raw))
+						return
+					}
 					lg.Event("live_sideband_event", "type", typ, "raw", clip(string(raw), 400))
-				})
+				}); err != nil {
+					lg.Event("live_sideband_read_failed", "err", err.Error())
+				}
 			}()
 		}
 		select {
@@ -354,7 +376,12 @@ func main() {
 			os.Exit(1)
 		}
 		sessionID, answerSDP = call.ID, call.Answer
-		hangupFn = func() { _ = cl.Hangup(context.Background(), call.ID) }
+		hangupFn = func() {
+			if err := cl.Hangup(context.Background(), call.ID); err != nil {
+				lg.Event("openaitest_hangup_failed", "session_id", call.ID, "err", err.Error())
+				fmt.Fprintln(os.Stderr, "hangup:", err)
+			}
+		}
 		if serr := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); serr != nil {
 			lg.Event("set_remote_failed", "err", serr.Error())
 			fmt.Fprintln(os.Stderr, "set remote:", serr)
@@ -368,8 +395,16 @@ func main() {
 			hangup()
 			os.Exit(1)
 		}
-		defer sb.Close()
-		go func() { _ = sb.Read(ctx) }()
+		defer func() {
+			if err := sb.Close(); err != nil {
+				lg.Event("realtime_sideband_close_failed", "err", err.Error())
+			}
+		}()
+		go func() {
+			if err := sb.Read(ctx); err != nil {
+				lg.Event("realtime_sideband_read_failed", "err", err.Error())
+			}
+		}()
 		if uerr := sb.SessionUpdate(ctx, map[string]any{
 			"type":         "realtime",
 			"instructions": *instr,
@@ -419,7 +454,7 @@ func main() {
 				"first_event_s", r.FirstEventAfter.Seconds(), "longest_gap_s", r.LongestGap.Seconds(),
 				"events", r.Events, "reasoning_chars", r.ReasoningChars,
 				"reasoning_tokens", r.ReasoningTokens, "truncated", r.Truncated, "status", r.Status,
-				"cost_usd", r.CostUSD, "answer", clip(r.Text, 300))
+				"cost_usd", r.CostUSD, "answer_chars", len(r.Text))
 		}
 	}
 
@@ -521,8 +556,10 @@ func playRTP(ctx context.Context, path string, track *webrtc.TrackLocalStaticRTP
 }
 
 func clip(s string, n int) string {
-	if len(s) <= n {
+	// by runes: Arabic is two bytes a letter, and a cut inside one leaves invalid UTF-8
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }

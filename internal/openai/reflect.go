@@ -14,6 +14,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -78,7 +79,8 @@ func (a *Answerer) Reflect(ctx context.Context, facts []string, transcript strin
 		body["reasoning"] = map[string]any{"effort": "low"}
 	}
 	out, err := a.post(ctx, body)
-	if err != nil && strings.Contains(err.Error(), "reasoning") && !a.noReasoningField.Load() {
+	var ae *apiError
+	if err != nil && errors.As(err, &ae) && strings.Contains(ae.Message, "reasoning") && !a.noReasoningField.Load() {
 		a.noReasoningField.Store(true)
 		delete(body, "reasoning")
 		out, err = a.post(ctx, body)

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -139,7 +140,11 @@ func TestCreateSessionStripsAudioFormat(t *testing.T) {
 // sweep finds it. The counter is made unwritable by taking the directory's write bit after the
 // lock file exists, so the admission check still passes and only the write after creation fails.
 func TestASessionTheCounterCannotRecordAndTheHangupCannotCloseGoesOnTheLedger(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only directory does not make a write fail on Windows")
+	}
 	dir := t.TempDir()
+	budgetDir := filepath.Join(dir, "budget")
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/hangup") {
@@ -147,24 +152,22 @@ func TestASessionTheCounterCannotRecordAndTheHangupCannotCloseGoesOnTheLedger(t 
 			w.WriteHeader(http.StatusUnauthorized) // not retried: the failure is immediate
 			return
 		}
+		// The counter becomes unwritable BETWEEN the admission and the record: the admission
+		// (Check) writes its hold, so the directory has to be writable until the session exists.
+		if err := os.Chmod(budgetDir, 0o500); err != nil {
+			t.Error(err)
+		}
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"session":{"id":"live_lost"},"transport":{"sdp":"v=0\r\n"}}`))
 	}))
 	defer srv.Close()
 	c := clientAt(srv)
 
-	budgetDir := filepath.Join(dir, "budget")
 	if err := os.MkdirAll(budgetDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	b, err := NewBudget(filepath.Join(budgetDir, "spend.json"), 5.0, nil)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Check(); err != nil { // creates the lock file while the directory is writable
-		t.Fatal(err)
-	}
-	if err := os.Chmod(budgetDir, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	defer os.Chmod(budgetDir, 0o700)

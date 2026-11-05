@@ -154,6 +154,20 @@ func (f *Farewell) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.recent, f.raw, f.armed, f.matched = "", "", false, ""
+	// The voice judge belongs to the leg that installed it: after that leg closes its LastVoice
+	// is frozen, and a frozen "silent" would let her echo cancel his next goodbye.
+	f.Speaking = nil
+}
+
+// SetSpeaking installs the voice judge under the lock Feed reads it with; a bare assignment
+// from the bridge raced the call inside Feed.
+func (f *Farewell) SetSpeaking(fn func() bool) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Speaking = fn
 }
 
 // farewellTail is how many CHARACTERS of the recent transcript are kept. A goodbye is short and
@@ -249,6 +263,30 @@ func (f *Farewell) Feed(text string) bool {
 		}
 	}
 	return false
+}
+
+// Arm records a goodbye that was understood rather than matched: the model heard him say it in
+// words the phrase list does not have, and asked for the call to end. It joins the same wait as a
+// matched phrase, measured from when the goodbye was said, so the line closes after she has
+// finished answering it and anything he says in the meantime still takes it back. It reports
+// whether this goodbye is NEW: when the phrase match got there first, one goodbye is one goodbye,
+// and the caller must not answer it a second time.
+func (f *Farewell) Arm(how string, at time.Time) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.armed {
+		return false
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	f.armed, f.armedAt, f.matched = true, at, how
+	f.recent, f.raw = "", ""
+	f.ev("farewell_heard", "phrase", how, "note", "closing unless the user speaks again")
+	return true
 }
 
 // Armed reports the goodbye that is waiting, and when it was heard. The caller decides when to act

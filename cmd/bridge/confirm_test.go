@@ -92,6 +92,7 @@ func TestPendingBelongsToOneCall(t *testing.T) {
 
 	// Stale is the same as absent.
 	p.arm("call-A", "notes_write", `{"text":"x"}`, "write x", "d1")
+	time.Sleep(2 * time.Millisecond) // a coarse clock (Windows) may not have ticked yet
 	if _, _, _, _, ok := p.waiting("call-A", time.Nanosecond); ok {
 		t.Error("a permission older than the window is still permission")
 	}

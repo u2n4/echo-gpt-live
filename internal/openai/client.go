@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,7 +71,7 @@ func (c *Client) event(ev string, kv ...any) {
 // CreateCall posts an SDP offer and returns the answer plus the call id.
 func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error) {
 	if c.APIKey == "" {
-		return nil, errors.New("no OpenAI API key")
+		return nil, ErrNoAPIKey
 	}
 	url := callsURL + "?model=" + c.Model
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(offerSDP))
@@ -87,15 +86,19 @@ func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error)
 		return nil, fmt.Errorf("create call: %w", err)
 	}
 	defer res.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("create call: %w", err)
+	}
 	c.event("openai_create_call", "status", res.StatusCode, "ms", time.Since(t0).Milliseconds(),
 		"location", res.Header.Get("Location"), "content_type", res.Header.Get("Content-Type"), "bytes", len(body))
 	if res.StatusCode != http.StatusCreated && res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("create call: HTTP %d: %s", res.StatusCode, truncate(string(body), 400))
+		return nil, fmt.Errorf("create call: %w", &StatusError{Op: "create call", Status: res.StatusCode})
 	}
 	answer := string(body)
 	if !strings.Contains(answer, "v=0") {
-		return nil, fmt.Errorf("create call: response is not SDP: %s", truncate(answer, 300))
+		c.event("openai_create_call_bad_sdp", "bytes", len(body))
+		return nil, fmt.Errorf("create call: %w", ErrBadSDP)
 	}
 	id := callIDRe.FindString(res.Header.Get("Location"))
 	if id == "" {
@@ -103,7 +106,7 @@ func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error)
 		id = callIDRe.FindString(answer)
 	}
 	if id == "" {
-		return nil, errors.New("create call: no call_id in Location header")
+		return nil, ErrNoCallID
 	}
 	return &Call{ID: id, Answer: answer, Model: c.Model}, nil
 }
@@ -165,7 +168,9 @@ func (s *Sideband) Read(ctx context.Context) error {
 		case strings.HasSuffix(t, ".delta"):
 			s.c.event("openai_event", "type", t, "bytes", len(data))
 		case t == "error":
-			s.c.event("openai_error", "detail", truncate(string(data), 600))
+			s.c.event("openai_error", "detail_chars", len(data))
+		case strings.Contains(t, "transcript") || strings.Contains(t, "text") || strings.Contains(t, "delta"):
+			s.c.event("openai_event", "type", t, "chars", len(data))
 		default:
 			s.c.event("openai_event", "type", t, "raw", truncate(string(data), 500))
 		}
@@ -188,10 +193,13 @@ func (c *Client) Hangup(ctx context.Context, callID string) error {
 		return err
 	}
 	defer res.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<16))
-	c.event("openai_hangup", "status", res.StatusCode, "body", truncate(string(b), 200))
+	b, err := io.ReadAll(io.LimitReader(res.Body, 1<<16))
+	if err != nil {
+		return fmt.Errorf("hangup: %w", err)
+	}
+	c.event("openai_hangup", "status", res.StatusCode, "body_chars", len(b))
 	if res.StatusCode >= 300 {
-		return fmt.Errorf("hangup: HTTP %d", res.StatusCode)
+		return fmt.Errorf("hangup: %w", &StatusError{Op: "hangup", Status: res.StatusCode})
 	}
 	return nil
 }

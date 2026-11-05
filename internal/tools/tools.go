@@ -18,11 +18,19 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+)
+
+// Shared sentinels. Match with errors.Is.
+var (
+	ErrNoSuchTool  = errors.New("no such tool")
+	ErrToolTimeout = errors.New("tool took too long")
+	ErrNoResult    = errors.New("no such search result")
 )
 
 // Access says what a tool is allowed to do. It is not advice; the registry enforces it.
@@ -211,7 +219,7 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string, confir
 	if !ok {
 		// Naming an unregistered tool is not an error to recover from quietly: it means the model
 		// invented one, and the answer has to say so rather than pretend.
-		return "", fmt.Errorf("no such tool %q; this assistant has: %v", name, r.Names())
+		return "", fmt.Errorf("%w %q; this assistant has: %v", ErrNoSuchTool, name, r.Names())
 	}
 	args := map[string]any{}
 	if rawArgs != "" {
@@ -234,7 +242,11 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string, confir
 		defer func() {
 			// A tool must not be able to take the assistant down mid-call.
 			if p := recover(); p != nil {
-				err = fmt.Errorf("%s panicked: %v", name, p)
+				if perr, ok := p.(error); ok {
+					err = fmt.Errorf("%s panicked: %w", name, perr)
+				} else {
+					err = fmt.Errorf("%s panicked: %v", name, p)
+				}
 			}
 		}()
 		out, err = t.Run(ctx, args)
@@ -244,7 +256,7 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string, confir
 	case <-done:
 		return out, err
 	case <-ctx.Done():
-		return "", fmt.Errorf("%s took longer than %s and was abandoned", name, t.Timeout)
+		return "", fmt.Errorf("%w: %s", ErrToolTimeout, name)
 	}
 }
 

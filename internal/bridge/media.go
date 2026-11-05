@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtp"
@@ -142,9 +143,10 @@ func loadAccessUnits(path string) ([][]byte, error) {
 
 // reflector forwards received audio RTP back to the local track after an optional delay.
 type reflector struct {
-	track *webrtc.TrackLocalStaticRTP
-	delay time.Duration
-	ch    chan delayed
+	track   *webrtc.TrackLocalStaticRTP
+	delay   time.Duration
+	ch      chan delayed
+	dropped atomic.Int64
 }
 
 type delayed struct {
@@ -162,6 +164,7 @@ func (r *reflector) push(p *rtp.Packet) {
 	select {
 	case r.ch <- delayed{at: time.Now().Add(r.delay), pkt: p}:
 	default: // drop if the delay buffer is full; never block the receive loop
+		r.dropped.Add(1)
 	}
 }
 
@@ -172,9 +175,15 @@ func (r *reflector) run() {
 		}
 		// Pion rewrites SSRC and payload type to the local track's binding; the
 		// Opus payload, sequence number, timestamp and marker are forwarded unchanged.
-		_ = r.track.WriteRTP(d.pkt)
+		// A write failure means the track is gone; count it, do not block the loop.
+		if err := r.track.WriteRTP(d.pkt); err != nil {
+			r.dropped.Add(1)
+		}
 	}
 }
+
+// Dropped reports reflector packets lost to a full buffer or a dead track.
+func (r *reflector) Dropped() int64 { return r.dropped.Load() }
 
 func (r *reflector) close() { close(r.ch) }
 
