@@ -224,21 +224,14 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	if a.greeting == "" {
 		close(greetDone)
 	} else {
-		// On its own clock, not this function's. The dial below can return before the Echo's
-		// transport is up, and this function's context ends with it; the greeting then stopped
-		// at packet 31 of 41 on the first real call, or never started. A greeting that outlives
-		// a dead session only fails its next write, which is fine; one cut short is heard.
-		gctx, gcancel := context.WithTimeout(context.Background(), greetingWait)
 		go func() {
 			defer close(greetDone)
-			defer gcancel()
 			select {
 			case <-s.Connected():
-			case <-gctx.Done():
-				a.ev("greeting_skipped", "reason", "the Echo did not connect in time")
+			case <-ctx.Done():
 				return
 			}
-			n, err := bridge.PlayGreeting(gctx, a.greeting, s.WriteAudio, splice)
+			n, err := bridge.PlayGreeting(ctx, a.greeting, s.WriteAudio, splice)
 			if err != nil {
 				a.ev("greeting_failed", "packets", n, "err", err.Error())
 				return
@@ -542,27 +535,6 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	a.ev("bridge_live", "openai_session", leg.SessionID, "forked_from", forkFrom,
 		"echo_session_age_s", s.Age().Seconds())
 
-	// Her hello, said through OpenAI's own stream the moment the session is up. The model was
-	// told to say it and on the 17:24 call it never did: first voice at 7 s, only after he spoke.
-	// The bridge-played clip says it at 2 s but both calls that used it (15:15, 18:24) lost the
-	// Echo's microphone: Amazon's media server stopped sending after 8-20 packets, at the moment
-	// our audio reached it, and every call whose first outbound audio came later (4 s) worked.
-	// So until that is understood the clip stays off, and this is the hello: about 3.5-4 s
-	// after the offer, through the same path everything else she says takes.
-	if a.greeting == "" {
-		if sb := leg.Sideband(); sb != nil {
-			go func() {
-				hctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if err := sb.Commentary(hctx, "", spokenHello); err != nil {
-					a.ev("hello_failed", "err", err.Error())
-					return
-				}
-				a.ev("hello_sent", "echo_session_age_s", s.Age().Seconds())
-			}()
-		}
-	}
-
 	if a.kickSidebandAfter > 0 {
 		// Test hook only. A stalled socket cannot be ordered from OpenAI, but the path that
 		// recovers from one - Read returns, a fresh attach to the same session, events resume -
@@ -686,9 +658,7 @@ func (a *app) greetingPolicy() string {
 	if a.greeting != "" {
 		return "الخط قال له \"هلا\" قبل ما تبدأ، فلا تسلّم ولا تعيدها؛ ابدأ بالاستماع، وإذا كان يتكلم أصلاً جاوبه على طول."
 	}
-	// The bridge says the hello on this path too (a spoken line at session start), so the model
-	// is told the same thing either way: it has been said, do not say it again.
-	return "الخط قال له \"هلا\" أول ما بدأت المكالمة، فلا تسلّم ولا تعيدها؛ ابدأ بالاستماع، وإذا كان يتكلم أصلاً جاوبه على طول."
+	return "أول ما تبدأ المكالمة قل \"هلا\" بكلمة وحدة عشان يعرف إنك تسمعه، بدون سلام طويل."
 }
 
 // envOr reads a setting from the environment so the service file can carry what is personal
@@ -992,7 +962,7 @@ func main() {
 		opusFmtp  = flag.String("opus-fmtp", bridge.DefaultOpusFmtp, "Opus fmtp asked of BOTH remote encoders (the Echo's and OpenAI's). Empty keeps the browser default")
 		noiseRed  = flag.String("noise-reduction", "off", "OpenAI input noise reduction: far_field, near_field or off. gpt-live-1 REJECTS this (measured: unknown_parameter session.audio.input); kept for the Realtime fallback")
 		recDir    = flag.String("record-dir", "", "write both audio directions to Ogg/Opus here (no transcoding: the files are exactly what crossed the bridge). Empty = off")
-		greeting  = flag.String("greeting", "", "Ogg/Opus file (one 20 ms packet per page) the bridge itself plays to the Echo the moment its transport is up, ~1.5 s before the OpenAI leg is ready. media/hala.ogg is her own «هلا» cut from a recording. Measured: the model's own hello reached the Echo 5-7 s after the offer; this reaches it at ~2 s, and the model is told not to greet again. WARNING, measured twice on 2026-09-16 (15:15 and 18:24): with the clip on, Amazon's media server stopped sending the Echo's microphone after 8-20 packets, at the moment the clip's audio reached it, and she never heard him; every call whose first outbound audio came later (~4 s) worked. Leave it empty until that is understood. Empty: the bridge has her say «هلا» through the OpenAI leg as soon as the session is up (~3.5-4 s)")
+		greeting  = flag.String("greeting", "", "Ogg/Opus file (one 20 ms packet per page) the bridge itself plays to the Echo the moment its transport is up, ~1.5 s before the OpenAI leg is ready. media/hala.ogg is her own «هلا» cut from a recording. Measured: the model's own hello reached the Echo 5-7 s after the offer; this reaches it at ~2 s, and the model is told not to greet again. Empty: the model greets")
 		budgetUSD = flag.Float64("daily-budget-usd", 1.0, "refuse to open a new GPT-Live session once this much has been spent today. Counted on disk per UTC day and shared with every other process on this machine. 0 disables the ceiling but keeps counting")
 		budgetP   = flag.String("budget-file", os.ExpandEnv("$HOME/.local/state/rtcdiag/spend.json"), "where the shared daily spend counter lives")
 		ledgerP   = flag.String("ledger", os.ExpandEnv("$HOME/.local/state/rtcdiag/open-live-sessions"), "file recording OpenAI sessions that are open and billing, so a killed process can be recovered from")
@@ -1283,11 +1253,6 @@ const farewellMaxWait = 10 * time.Second
 // socket is lost for good. With the 60 s idle timer after it, a call whose goodbye can no longer
 // be heard ends within about three minutes instead of at the ten-minute cap.
 const sidebandLostGrace = 2 * time.Minute
-
-// greetingWait bounds her «هلا»: the wait for the Echo's transport plus the clip itself. The Echo
-// connects 1.3-2.2 s after the offer and the clip is 0.8 s; a call that has not connected by
-// then is not going to be greeted, and nothing else should wait on it.
-const greetingWait = 8 * time.Second
 
 // farewellReplyWait is how long his goodbye waits for hers to BEGIN. Measured replies start 1-3 s
 // after his words; a model that says nothing at all ends the call after this instead.

@@ -226,7 +226,8 @@ type liveCreateResponse struct {
 var ErrSessionCreated = errors.New("paid session was already created")
 
 // recoveredLiveID reads the session object even when the rest of the JSON was cut
-// short. Only a complete session object is trusted; arbitrary text is not an ID.
+// short. A complete string token at .session.id is enough; neither enclosing
+// object needs to finish. The decoder rejects an unterminated string or escape.
 func recoveredLiveID(raw []byte) string {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
@@ -238,11 +239,26 @@ func recoveredLiveID(raw []byte) string {
 			return ""
 		}
 		if key == "session" {
-			var session struct {
-				ID string `json:"id"`
+			if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
+				return ""
 			}
-			if d.Decode(&session) == nil {
-				return session.ID
+			for d.More() {
+				key, err := d.Token()
+				if err != nil {
+					return ""
+				}
+				if key == "id" {
+					tok, err := d.Token()
+					if err != nil {
+						return ""
+					}
+					id, _ := tok.(string)
+					return id
+				}
+				var skip json.RawMessage
+				if d.Decode(&skip) != nil {
+					return ""
+				}
 			}
 			return ""
 		}
@@ -404,6 +420,9 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 		"billed_init_seconds", liveInitBilledSeconds, "bytes", len(raw))
 	var out liveCreateResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
+		if id := recoveredLiveID(raw); id != "" {
+			return nil, c.closeRecoveredSession(id, fmt.Errorf("create live session: %w", err))
+		}
 		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	if res.StatusCode != http.StatusCreated && res.StatusCode != http.StatusOK {
@@ -417,7 +436,11 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	if out.Session.ID == "" || out.Transport.SDP == "" {
-		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
+		err := fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
+		if out.Session.ID != "" {
+			return nil, c.closeRecoveredSession(out.Session.ID, err)
+		}
+		return nil, err
 	}
 	// Count the money the moment it is committed, not when the session closes: a process that dies
 	// in between must still leave the cost on the record.
@@ -688,16 +711,11 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 	// A 4xx with a well-formed error body parses fine and has no session id; a 2xx with no
 	// answer SDP would be a session that exists and can never connect. Both are failures.
 	if err := json.Unmarshal(raw, &out); err != nil || res.StatusCode >= 300 || out.Session.ID == "" || out.Transport.SDP == "" {
-		c.Budget.Abandon()
-		if out.Session.ID != "" {
-			c.event("live_fork_unusable", "session_id", out.Session.ID, "status", res.StatusCode,
-				"action", "hanging up: created without an answer")
-			hctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			if herr := c.HangupRetry(hctx, out.Session.ID, 3); herr != nil {
-				c.event("live_fork_cleanup_failed", "session_id", out.Session.ID, "err", herr.Error())
-			}
+		if id := recoveredLiveID(raw); id != "" {
+			cause := fmt.Errorf("fork: %w", &StatusError{Op: "fork", Status: res.StatusCode})
+			return nil, c.closeRecoveredSession(id, cause)
 		}
+		c.Budget.Abandon()
 		if out.Error != nil {
 			return nil, fmt.Errorf("fork: %w", &apiError{
 				Code:    out.Error.Code,

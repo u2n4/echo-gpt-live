@@ -83,16 +83,15 @@ func (p *paceMeter) mark(ts uint32, marker bool) {
 	gap := now.Sub(p.last)
 	if p.haveTS {
 		media := time.Duration(int64(int32(ts-p.lastTS)) * int64(time.Second) / opusClockRate)
-		if media >= 0 {
+		if media >= 0 && media < time.Second {
 			p.mediaTotal += media
-			p.lastTS = ts
 			if d := gap - media; d > 100*time.Millisecond {
 				p.stepDeficit += d
 				p.steps++
 			}
 		}
 	}
-	p.haveTS = true
+	p.haveTS, p.lastTS = true, ts
 	p.last = now
 	p.gaps = append(p.gaps, gap)
 	switch {
@@ -120,15 +119,15 @@ func (p *paceMeter) flush(now time.Time) {
 	span := now.Sub(p.windowFrom).Seconds()
 	deficit := time.Duration(span*float64(time.Second)) - p.mediaTotal
 	p.ev("pace_"+p.label,
-		"pkts", n,
-		"pkts_per_s", float64(n)/span,
+		"pkts", n+1,
+		"pkts_per_s", float64(n+1)/span,
 		"media_covers_frac", p.mediaTotal.Seconds()/span,
 		"deficit_ms", deficit.Milliseconds(),
 		"deficit_in_steps_ms", p.stepDeficit.Milliseconds(),
 		"steps_over_100ms", p.steps,
 		"marker_bits_seen", p.markers,
 		"gap_median_ms", ms(sorted[n/2]),
-		"gap_p95_ms", ms(sorted[(n*95+99)/100-1]),
+		"gap_p95_ms", ms(sorted[(n*95)/100]),
 		"gap_max_ms", ms(sorted[n-1]),
 		"burst_frac", float64(p.bursts)/float64(n),
 		"starved_frac", float64(p.starves)/float64(n),

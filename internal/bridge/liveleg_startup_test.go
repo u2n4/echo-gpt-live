@@ -25,6 +25,8 @@ func TestRecoveredForkNeverFallsBack(t *testing.T) {
 	for _, body := range []string{
 		`{"session":{"id":"live_recovered"},"transport":{"sdp":"v=0\r\n"}}`,
 		`{"session":{"id":"live_recovered"},"transport":`,
+		`{"session":{"id":"live_recovered"`,
+		`{"session":{"id":"live_recovered","model":`,
 	} {
 		for _, cleanup := range []int{200, 401} {
 			c := openai.NewLive("fake-key", "")
