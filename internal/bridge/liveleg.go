@@ -435,22 +435,7 @@ func DialLive(
 		"has_m_application", strings.Contains(offerSDP, "m=application"), "bytes", len(offerSDP))
 
 	l.started = time.Now()
-	var sess *openai.LiveSession
-	forked := false
-	if forkFrom != "" {
-		sess, err = client.Fork(ctx, forkFrom, offerSDP)
-		if err != nil {
-			// A fork can fail because the stored session expired; a fresh session is still
-			// better than no assistant, so fall back and say so.
-			ev("live_fork_failed", "source", forkFrom, "err", err.Error(), "action", "creating a fresh session")
-			sess, err = client.CreateSession(ctx, offerSDP, sessCfg)
-		} else {
-			forked = true
-			ev("live_forked", "from", forkFrom, "to", sess.ID)
-		}
-	} else {
-		sess, err = client.CreateSession(ctx, offerSDP, sessCfg)
-	}
+	sess, forked, err := createLiveSession(ctx, client, forkFrom, offerSDP, sessCfg, ev)
 	if err != nil {
 		_ = pc.Close()
 		return nil, err
@@ -598,6 +583,25 @@ func DialLive(
 		return nil, err
 	}
 	return l, nil
+}
+
+// Keep session creation separate from transport setup so the paid fallback path
+// can be exercised without opening a PeerConnection or any live service.
+func createLiveSession(ctx context.Context, client *openai.LiveClient, forkFrom, offerSDP string, cfg openai.LiveSessionConfig, ev Events) (*openai.LiveSession, bool, error) {
+	if forkFrom != "" {
+		sess, err := client.Fork(ctx, forkFrom, offerSDP)
+		if err == nil {
+			ev("live_forked", "from", forkFrom, "to", sess.ID)
+			return sess, true, nil
+		}
+		if errors.Is(err, openai.ErrSessionCreated) {
+			return nil, false, err // already billed: never create a second session
+		}
+		// An expired source can still fall back when no paid session was recovered.
+		ev("live_fork_failed", "source", forkFrom, "err", err.Error(), "action", "creating a fresh session")
+	}
+	sess, err := client.CreateSession(ctx, offerSDP, cfg)
+	return sess, false, err
 }
 
 func (l *LiveLeg) readInbound(tr *webrtc.TrackRemote) {

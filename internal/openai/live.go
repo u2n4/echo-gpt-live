@@ -221,6 +221,60 @@ type liveCreateResponse struct {
 	} `json:"error"`
 }
 
+// ErrSessionCreated marks a failed setup that already incurred a session charge.
+// Callers must not fall back to creating another paid session, even after cleanup.
+var ErrSessionCreated = errors.New("paid session was already created")
+
+// recoveredLiveID reads the session object even when the rest of the JSON was cut
+// short. Only a complete session object is trusted; arbitrary text is not an ID.
+func recoveredLiveID(raw []byte) string {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
+		return ""
+	}
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return ""
+		}
+		if key == "session" {
+			var session struct {
+				ID string `json:"id"`
+			}
+			if d.Decode(&session) == nil {
+				return session.ID
+			}
+			return ""
+		}
+		var skip json.RawMessage
+		if d.Decode(&skip) != nil {
+			return ""
+		}
+	}
+	return ""
+}
+
+// closeRecoveredSession persists the ID before cleanup and counts the committed
+// init charge. Failed cleanup leaves the ledger entry for the next sweep.
+func (c *LiveClient) closeRecoveredSession(id string, cause error) error {
+	var ledgerErr error
+	if c.Ledger != nil {
+		ledgerErr = c.Ledger.Add(id)
+	}
+	budgetErr := c.Budget.Opened()
+	hctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	hangupErr := c.HangupRetry(hctx, id, 3)
+	if hangupErr == nil {
+		if c.Ledger != nil {
+			c.Ledger.Remove(id)
+		}
+	} else {
+		c.event("live_recovered_cleanup_failed", "session_id", id, "err", hangupErr.Error())
+	}
+	return errors.Join(fmt.Errorf("session %s: %w", id, ErrSessionCreated), cause, ledgerErr, budgetErr, hangupErr)
+}
+
 // StorageDenied reports whether an error is the project refusing stored sessions. A project with
 // data persistence disabled (or Zero Data Retention) rejects store:true, and fork depends on it.
 func StorageDenied(err error) bool {
@@ -273,7 +327,7 @@ func (c *LiveClient) CreateSession(ctx context.Context, offerSDP string, cfg Liv
 		c.storeDenied.Store(true)
 		sess, err = c.createOnce(ctx, offerSDP, cfg)
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrSessionCreated) {
 		c.Budget.Abandon() // nothing was created; the admission goes back
 	}
 	return sess, err
@@ -341,6 +395,9 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
+		if id := recoveredLiveID(raw); id != "" {
+			return nil, c.closeRecoveredSession(id, fmt.Errorf("create live session: %w", err))
+		}
 		return nil, fmt.Errorf("create live session: %w", err)
 	}
 	c.event("live_create_session", "status", res.StatusCode, "ms", time.Since(t0).Milliseconds(),
@@ -620,6 +677,9 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
+		if id := recoveredLiveID(raw); id != "" {
+			return nil, c.closeRecoveredSession(id, fmt.Errorf("fork: %w", err))
+		}
 		c.Budget.Abandon()
 		return nil, fmt.Errorf("fork: %w", err)
 	}
