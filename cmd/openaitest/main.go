@@ -31,6 +31,16 @@ import (
 	"github.com/u2n4/echo-gpt-live/internal/openai"
 )
 
+func speakOnceAt(runCtx context.Context, speakAt string, play func(string)) func(string) {
+	var speakOnce sync.Once
+	return func(when string) {
+		if when != speakAt || runCtx.Err() != nil {
+			return
+		}
+		speakOnce.Do(func() { play(when) })
+	}
+}
+
 func main() {
 	var (
 		keyFile  = flag.String("key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "file holding the OpenAI API key")
@@ -262,25 +272,19 @@ func main() {
 	// The file is spoken once, from whichever moment --speak-at names; the first caller wins.
 	runCtx, cancel := context.WithTimeout(ctx, *dur)
 	defer cancel()
-	var speakOnce sync.Once
-	speak := func(when string) {
-		if runCtx.Err() != nil {
+	speak := speakOnceAt(runCtx, *speakAt, func(when string) {
+		if _, err := os.Stat(*audioF); err != nil {
+			lg.Event("no_audio_file", "path", *audioF, "note", "session will stay silent; use --audio-file to speak")
 			return
 		}
-		speakOnce.Do(func() {
-			if _, err := os.Stat(*audioF); err != nil {
-				lg.Event("no_audio_file", "path", *audioF, "note", "session will stay silent; use --audio-file to speak")
-				return
-			}
-			lg.Event("speak_start", "at", when, "ms_since_start", time.Since(start).Milliseconds(), "rtp_burst", *rtpBurst)
-			onErr := func(e error) { lg.Event("audio_file_error", "err", e.Error()) }
-			if *rtpBurst {
-				go playRTP(runCtx, *audioF, rtpTrack, *burst, onErr)
-				return
-			}
-			go bridge.PlayOggOnce(runCtx, *audioF, track, *burst, onErr)
-		})
-	}
+		lg.Event("speak_start", "at", when, "ms_since_start", time.Since(start).Milliseconds(), "rtp_burst", *rtpBurst)
+		onErr := func(e error) { lg.Event("audio_file_error", "err", e.Error()) }
+		if *rtpBurst {
+			go playRTP(runCtx, *audioF, rtpTrack, *burst, onErr)
+			return
+		}
+		go bridge.PlayOggOnce(runCtx, *audioF, track, *burst, onErr)
+	})
 	if *speakAt == "connected" {
 		go func() {
 			select {
