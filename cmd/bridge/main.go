@@ -189,6 +189,23 @@ func (a *app) Offer(id, offer string) (string, error) {
 // startup. This is a capacity, not an added delay: release as soon as Live is ready.
 const holdPackets = 1000
 
+// Greeting playback outlives attachLive's dial context, but is bounded to eight seconds.
+func startGreeting(connected <-chan struct{}, play func(context.Context)) chan struct{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer cancel()
+		select {
+		case <-connected:
+		case <-ctx.Done():
+			return
+		}
+		play(ctx)
+	}()
+	return done
+}
+
 // attachLive dials GPT-Live and connects the two media legs.
 func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	defer a.dials.Done()
@@ -224,20 +241,14 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	if a.greeting == "" {
 		close(greetDone)
 	} else {
-		go func() {
-			defer close(greetDone)
-			select {
-			case <-s.Connected():
-			case <-ctx.Done():
-				return
-			}
+		greetDone = startGreeting(s.Connected(), func(ctx context.Context) {
 			n, err := bridge.PlayGreeting(ctx, a.greeting, s.WriteAudio, splice)
 			if err != nil {
 				a.ev("greeting_failed", "packets", n, "err", err.Error())
 				return
 			}
 			a.ev("greeting_played", "packets", n, "echo_session_age_s", s.Age().Seconds())
-		}()
+		})
 	}
 
 	leg, err := bridge.DialLive(ctx, a.live, sessCfg, a.liveCfg, forkFrom, a.ev)

@@ -9,6 +9,53 @@ import (
 	"github.com/u2n4/echo-gpt-live/internal/bridge"
 )
 
+func TestGreetingOwnsContextUntilPlaybackFinishes(t *testing.T) {
+	connected := make(chan struct{})
+	playing := make(chan context.Context, 1)
+	finish := make(chan struct{})
+	defer close(finish)
+	started := time.Now()
+	done := startGreeting(connected, func(ctx context.Context) {
+		playing <- ctx
+		<-finish
+	})
+	select {
+	case <-done:
+		t.Fatal("greeting gate released before connection")
+	case <-playing:
+		t.Fatal("greeting played before connection")
+	default:
+	}
+	close(connected)
+	var ctx context.Context
+	select {
+	case ctx = <-playing:
+	case <-time.After(time.Second):
+		t.Fatal("greeting did not start after connection")
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || deadline.Before(started.Add(8*time.Second)) || deadline.After(time.Now().Add(8*time.Second)) {
+		t.Errorf("greeting deadline = %v, present = %v; want eight-second context", deadline, ok)
+	}
+	if ctx.Err() != nil {
+		t.Errorf("greeting context ended during playback: %v", ctx.Err())
+	}
+	select {
+	case <-done:
+		t.Fatal("greeting gate released during playback")
+	default:
+	}
+	finish <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("greeting gate not released after playback")
+	}
+	if ctx.Err() != context.Canceled {
+		t.Errorf("playback context after completion = %v, want canceled", ctx.Err())
+	}
+}
+
 func TestTransportRetirementInvalidatesDialOwnership(t *testing.T) {
 	s := &bridge.Session{ID: "test_session"}
 	a := &app{sess: s}
