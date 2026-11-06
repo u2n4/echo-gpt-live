@@ -38,7 +38,6 @@ type Recorder struct {
 	mu     sync.Mutex
 	w      *oggwriter.OggWriter
 	path   string
-	spilt  bool // a second file was opened after the first died; only one is allowed
 	n      int64
 	empty  int64 // padding-only packets, which carry no Opus frame
 	failed int64
@@ -150,23 +149,7 @@ func (r *Recorder) write(p *rtp.Packet) {
 				"consecutive_failures", r.consec, "err", err.Error())
 			_ = r.w.Close()
 			r.w = nil
-			// A dead file must not cost the rest of the call: the recording continues in a
-			// second file, once. A second death (the disk is gone) closes for good rather
-			// than chaining part files nobody can play. Muse found it.
-			if r.spilt {
-				r.closed = true
-				return
-			}
-			r.spilt = true
-			spill := r.path + ".part2"
-			w, oerr := oggwriter.New(spill, 48000, 1)
-			if oerr != nil {
-				r.ev("record_open_failed", "path", spill, "err", oerr.Error())
-				r.closed = true
-				return
-			}
-			r.ev("record_open", "path", spill, "note", "continuation after the first file died")
-			r.w, r.path, r.consec = w, spill, 0
+			r.closed = true
 		}
 		return
 	}

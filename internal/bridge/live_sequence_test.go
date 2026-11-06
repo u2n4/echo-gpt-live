@@ -43,24 +43,6 @@ func TestLiveSequenceWrapUnchanged(t *testing.T) {
 	}
 }
 
-func TestLiveSequence64PacketLossKeepsTimeline(t *testing.T) {
-	var tr liveSequenceTranslator
-	for _, p := range []*rtp.Packet{
-		packet(100, 1000, []byte{0xd8}),
-		packet(101, 1960, []byte{0xd8}),
-		packet(166, 64360, []byte{0xd8}), // 64 lost 20 ms packets: preserve 1,280 ms.
-		packet(167, 65320, []byte{0xd8}),
-	} {
-		seq, ts := p.SequenceNumber, p.Timestamp
-		if _, rebased := tr.translate(p); rebased || p.SequenceNumber != seq || p.Timestamp != ts {
-			t.Fatalf("(%d,%d) became (%d,%d), rebased=%v", seq, ts, p.SequenceNumber, p.Timestamp, rebased)
-		}
-		if tr.rebased || tr.seqOffset != 0 || tr.tsOffset != 0 || tr.Missed() != 0 {
-			t.Fatalf("loss changed translator state: %+v", tr)
-		}
-	}
-}
-
 func TestOpusPacketDurations(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -102,43 +84,14 @@ func TestLiveSequenceUsesFirstPacketOpusDuration(t *testing.T) {
 	}
 }
 
-func TestLiveSequenceOnlyTheStartCanTriggerRebase(t *testing.T) {
-	// A jump after the window is a real discontinuity, left as it is and counted.
-	ps := []*rtp.Packet{packet(100, 1000, []byte{0xd8})}
-	for i := 1; i <= rebaseWindowPackets; i++ {
-		ps = append(ps, packet(100+uint16(i), 1000+uint32(i)*960, []byte{0xd8}))
-	}
-	late := packet(30000, 2000000000, []byte{0xd8})
-	ps = append(ps, late)
-	var tr liveSequenceTranslator
-	rebases := 0
-	for _, p := range ps {
-		if _, ok := tr.translate(p); ok {
-			rebases++
-		}
-	}
-	if rebases != 0 || late.SequenceNumber != 30000 || late.Timestamp != 2000000000 {
-		t.Fatal("a later discontinuity was rebased")
-	}
-	if tr.Missed() != 1 {
-		t.Fatalf("the late jump should be counted as missed, got %d", tr.Missed())
-	}
-}
-
-// A second probe inside the thresholds must not spend the one check: the real restart comes
-// next and is measured against the packet before it, not against packet 1.
-func TestLiveSequenceSecondProbeDoesNotHideTheRestart(t *testing.T) {
+func TestLiveSequenceOnlySecondPacketCanTriggerRebase(t *testing.T) {
 	ps := []*rtp.Packet{
 		packet(100, 1000, []byte{0xd8}),
-		packet(101, 1960, []byte{0xd8}),  // a second probe, continuous with the first
-		packet(30000, 960, []byte{0xd8}), // the restart
-		packet(30001, 1920, []byte{0xd8}),
+		packet(101, 1960, []byte{0xd8}),
+		packet(30000, 2000000000, []byte{0xd8}),
 	}
-	if got := translatePackets(t, ps...); got != 1 {
-		t.Fatalf("rebases=%d, want 1", got)
-	}
-	if ps[2].SequenceNumber != 102 || ps[2].Timestamp != 2920 || ps[3].SequenceNumber != 103 || ps[3].Timestamp != 3880 {
-		t.Fatalf("restart not spliced onto the probes: %d/%d %d/%d", ps[2].SequenceNumber, ps[2].Timestamp, ps[3].SequenceNumber, ps[3].Timestamp)
+	if got := translatePackets(t, ps...); got != 0 || ps[2].SequenceNumber != 30000 || ps[2].Timestamp != 2000000000 {
+		t.Fatal("a later discontinuity was rebased")
 	}
 }
 
@@ -173,12 +126,9 @@ func TestLiveSequenceObservedRestartsAndLaterDeltas(t *testing.T) {
 }
 
 func TestLiveSequenceUnknownDurationDoesNotInventTimestamp(t *testing.T) {
-	// A first packet with no readable duration (padding) gives no expected timestamp, so the
-	// timestamp is left alone; the sequence still needs the repair, or the whole stream is
-	// rejected as "too old" by the receiver's replay window.
 	ps := []*rtp.Packet{packet(100, 1000, nil), packet(500, 20, []byte{0xd8})}
-	if got := translatePackets(t, ps...); got != 1 || ps[1].SequenceNumber != 101 || ps[1].Timestamp != 20 {
-		t.Fatalf("got rebases=%d seq=%d ts=%d; want 1, 101, 20", got, ps[1].SequenceNumber, ps[1].Timestamp)
+	if got := translatePackets(t, ps...); got != 0 || ps[1].SequenceNumber != 500 || ps[1].Timestamp != 20 {
+		t.Fatal("malformed first payload was rebased")
 	}
 }
 

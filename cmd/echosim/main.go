@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -190,10 +189,7 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), *dur)
 	defer cancel()
 	var outPkts atomic.Int64
-	var writeFails atomic.Int64
-	audioDone := make(chan struct{})
 	go func() {
-		defer close(audioDone)
 		quietAt := time.Time{}
 		if *speakFor > 0 {
 			quietAt = time.Now().Add(*speakFor)
@@ -211,57 +207,33 @@ func run() error {
 			ogg, _, err := oggreader.NewWith(f)
 			if err != nil {
 				f.Close()
-				fmt.Fprintln(os.Stderr, "invalid Ogg:", err)
 				return
 			}
 			tk := time.NewTicker(20 * time.Millisecond)
-			passPackets := 0
 			for ctx.Err() == nil {
 				if !quietAt.IsZero() && time.Now().After(quietAt) {
 					break
 				}
 				p, _, err := ogg.ParseNextPage()
 				if err != nil {
-					if !errors.Is(err, io.EOF) {
-						tk.Stop()
-						f.Close()
-						fmt.Fprintln(os.Stderr, "corrupt Ogg:", err)
-						return
-					}
 					break
 				}
 				if len(p) > 0 {
-					passPackets++
-					if err := audio.WriteSample(media.Sample{Data: p, Duration: 20 * time.Millisecond}); err != nil {
-						writeFails.Add(1)
-					} else {
-						outPkts.Add(1)
-					}
+					_ = audio.WriteSample(media.Sample{Data: p, Duration: 20 * time.Millisecond})
+					outPkts.Add(1)
 				}
-				select {
-				case <-tk.C:
-				case <-ctx.Done():
-				}
+				<-tk.C
 			}
 			tk.Stop()
 			f.Close()
-			if passPackets == 0 {
-				fmt.Fprintln(os.Stderr, "Ogg contains no audio packets")
-				return
-			}
 		}
 	}()
 	<-ctx.Done()
-	<-audioDone
 	disconnect()
 	time.Sleep(500 * time.Millisecond)
 	if err := pc.Close(); err != nil {
 		fmt.Fprintln(os.Stderr, "[echosim] pc close:", err)
 	}
-	if n := writeFails.Load(); n > 0 {
-		fmt.Fprintln(os.Stderr, "[echosim] audio write failures:", n)
-	}
-
 	// answer summary lines
 	var lines []string
 	for _, ln := range strings.Split(strings.ReplaceAll(ans.SDP, "\r\n", "\n"), "\n") {

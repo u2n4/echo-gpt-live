@@ -15,7 +15,7 @@ func TestReflectorCloseRacesWithPush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := newReflector(track, time.Hour)
+	r := newReflector(track, 0)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -35,6 +35,14 @@ func TestReflectorCloseRacesWithPush(t *testing.T) {
 		t.Fatal("Close waited for delayed media")
 	}
 	r.push(&rtp.Packet{})
+	select {
+	case <-r.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("reflector did not drain queued packets")
+	}
+	if len(r.ch) != 0 {
+		t.Fatal("close discarded queued packets")
+	}
 }
 
 func TestEventTypeUsesTopLevelJSON(t *testing.T) {

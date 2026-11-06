@@ -36,6 +36,8 @@ func TestLiveBodyReadFailureClosesRecoveredSession(t *testing.T) {
 		for _, raw := range []string{
 			`{"session":{"id":"live_recovered"},"transport":{"sdp":"v=0\r\n"}}`,
 			`{"session":{"id":"live_recovered"},"transport":`,
+			`{"session":{"id":"live_recovered"`,
+			`{"session":{"id":"live_recovered","model":`,
 		} {
 			for _, cleanupStatus := range []int{200, 401, 503} {
 				t.Run(fmt.Sprintf("fork=%v/body=%s/cleanup=%d", fork, raw, cleanupStatus), func(t *testing.T) {
@@ -89,6 +91,87 @@ func TestLiveBodyReadFailureClosesRecoveredSession(t *testing.T) {
 					spent, sessions := c.Budget.Report()
 					if sessions != 1 || spent != EstimateLiveCostUSD(0) {
 						t.Fatalf("spent=%v sessions=%d", spent, sessions)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRecoveredLiveIDRequiresCompleteStringAtSessionID(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{"session":`, ""},
+		{`{"session":{"id":`, ""},
+		{`{"session":{"id":"live_recover`, ""},
+		{`{"session":{"id":"live_recovered\`, ""},
+		{`{"session":{"id":"live_recovered\u00`, ""},
+		{`{"session":{"id":123`, ""},
+		{`{"session":{"id":null`, ""},
+		{`{"id":"wrong","session":{"nested":{"id":"wrong"},"id":"live_recovered"`, "live_recovered"},
+		{`{"session":{"nested":{"id":"wrong"},"model":`, ""},
+		{`{"session":{"id":"live_recovered"`, "live_recovered"},
+		{`{"session":{"id":"live_\u0072ecovered","model":`, "live_recovered"},
+	} {
+		if got := recoveredLiveID([]byte(tc.raw)); got != tc.want {
+			t.Errorf("recoveredLiveID(%q)=%q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestLiveTruncationBoundaries(t *testing.T) {
+	const body = `{"session":{"id":"live_recovered","model":`
+	idEnd := strings.Index(body, `","model"`) + 1
+	for _, fork := range []bool{false, true} {
+		for _, readFailure := range []bool{false, true} {
+			for cut := 0; cut <= len(body); cut++ {
+				t.Run(fmt.Sprintf("fork=%v/readFailure=%v/cut=%d", fork, readFailure, cut), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					c := NewLive("fake-key", LiveModel)
+					var err error
+					c.Ledger, err = NewLedger(filepath.Join(t.TempDir(), "open"), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					c.Budget, err = NewBudget(filepath.Join(t.TempDir(), "spend.json"), 1, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					creates, hangups := 0, 0
+					c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if strings.HasSuffix(r.URL.Path, "/hangup") {
+							hangups++
+							if r.URL.Path != "/v1/live/sessions/live_recovered/hangup" || cut < idEnd {
+								t.Fatalf("cleanup used incomplete/wrong id: %s", r.URL.Path)
+							}
+							if ids := c.Ledger.Open(); len(ids) != 1 || ids[0] != "live_recovered" {
+								t.Fatalf("missing ledger before cleanup: %v", ids)
+							}
+							return &http.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+						}
+						creates++
+						var reader io.Reader = strings.NewReader(body[:cut])
+						if readFailure {
+							reader = failedResponseBody{reader, cancel}
+						}
+						return &http.Response{StatusCode: 201, Body: io.NopCloser(reader)}, nil
+					})}
+					var sess *LiveSession
+					if fork {
+						sess, err = c.Fork(ctx, "live_source", "offer")
+					} else {
+						sess, err = c.CreateSession(ctx, "offer", LiveSessionConfig{})
+					}
+					want := 0
+					if cut >= idEnd {
+						want = 1
+					}
+					spent, sessions := c.Budget.Report()
+					if sess != nil || err == nil || errors.Is(err, ErrSessionCreated) != (want == 1) || creates != 1 || hangups != want || len(c.Ledger.Open()) != want || sessions != want || spent != float64(want)*EstimateLiveCostUSD(0) {
+						t.Fatalf("sess=%v err=%v creates=%d hangups=%d ledger=%v sessions=%d spent=%v want=%d", sess, err, creates, hangups, c.Ledger.Open(), sessions, spent, want)
+					}
+					if readFailure && !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("lost body read error: %v", err)
 					}
 				})
 			}

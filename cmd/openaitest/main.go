@@ -264,7 +264,7 @@ func main() {
 	defer cancel()
 	var speakOnce sync.Once
 	speak := func(when string) {
-		if when != *speakAt || runCtx.Err() != nil {
+		if runCtx.Err() != nil {
 			return
 		}
 		speakOnce.Do(func() {
