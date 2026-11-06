@@ -78,9 +78,11 @@ type app struct {
 
 	// offerMu admits one offer at a time. Two copies of the same directive arriving together used
 	// to both pass the repeat check before either had published its session, and both built one.
-	offerMu sync.Mutex
-	closing atomic.Bool    // set at shutdown; an offer that arrives after it is refused
-	dials   sync.WaitGroup // dials in flight, so shutdown can wait for them to close what they built
+	offerMu         sync.Mutex
+	callMu          sync.Mutex      // serialize attaching resources with closeLeg's cleanup
+	resourceSession *bridge.Session // protected by callMu; late cleanup cannot touch a newer call
+	closing         atomic.Bool     // set at shutdown; an offer that arrives after it is refused
+	dials           sync.WaitGroup  // dials in flight, so shutdown can wait for them to close what they built
 
 	mu       sync.Mutex
 	sess     *bridge.Session
@@ -91,6 +93,7 @@ type app struct {
 	// The offer that made the current session and the answer it got, so a redelivery of the same
 	// directive gets the same answer instead of a fresh start.
 	lastOffer, lastAnswer string
+	seenOffers            map[string]time.Time // retired directives must not start paid calls again
 
 	reflecting atomic.Bool // one after-the-call memory pass at a time
 }
@@ -129,6 +132,9 @@ func (a *app) Offer(id, offer string) (string, error) {
 		return answer, nil
 	}
 	a.mu.Unlock()
+	if err := a.admitOffer(id); err != nil {
+		return "", err
+	}
 
 	a.teardown("replaced_by_new_offer")
 
@@ -153,18 +159,18 @@ func (a *app) Offer(id, offer string) (string, error) {
 	// swallows a failed POST - the OpenAI side used to keep billing until the idle timer noticed
 	// nobody was talking. The transport itself is the earlier signal.
 	s.SetOnDown(func(reason string) {
-		a.mu.Lock()
-		cur := a.sess
-		a.mu.Unlock()
-		if cur != s {
+		if !a.retireSession(s) {
 			return
 		}
-		a.ev("echo_transport_down", "reason", reason, "note", "hanging up OpenAI; the Echo session is left for Alexa's directive or the watchdog")
-		a.closeLeg(reason)
+		a.ev("echo_transport_down", "reason", reason, "note", "invalidating the call and hanging up OpenAI")
+		s.SetAudioSink(nil)
+		a.closeLegFor(s, reason)
+		s.Close(reason)
 	})
 
 	a.mu.Lock()
 	a.sess = s
+	a.seenOffers[id] = time.Now()
 	a.lastOffer, a.lastAnswer = offer, answer
 	forkFrom := a.lastLive
 	if a.sessCfg.Store != nil && !*a.sessCfg.Store {
@@ -251,6 +257,8 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 		return
 	}
 
+	a.callMu.Lock()
+	defer a.callMu.Unlock()
 	a.mu.Lock()
 	if a.sess != s { // a newer invocation arrived, or Alexa hung up, while we were dialling
 		a.mu.Unlock()
@@ -259,6 +267,7 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 		hold.Drop()
 		return
 	}
+	a.resourceSession = s
 	a.leg = leg
 	a.lastLive = leg.SessionID
 	// When the assistant goes, the call goes. Idle used to hang up OpenAI and leave the Echo
@@ -268,7 +277,7 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	// only way to find out whether Alexa hangs up when the transport goes (F-UNK-3).
 	gate := openai.NewIdleGate(a.idleFor, func(idle time.Duration) {
 		a.ev("idle_close", "idle_s", idle.Seconds(), "note", "no one has spoken for this long; ending the call")
-		a.teardown("idle")
+		a.teardownFor(s, "idle")
 	})
 	a.gate = gate
 	a.mu.Unlock()
@@ -280,7 +289,7 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 			return // closed by the bridge itself, which is already cleaning up
 		}
 		a.ev("live_leg_ended_on_its_own", "reason", reason, "note", "ending the call around it")
-		a.teardown(reason)
+		a.teardownFor(s, reason)
 	})
 
 	// The idle timer used to be fed by RTP arrival, which made it useless: the Echo streams its
@@ -567,13 +576,18 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	}
 }
 
-// closeLeg hangs up only the OpenAI side, stopping the per-minute clock while the Echo session
-// stays connected and keeps its video flowing.
-func (a *app) closeLeg(reason string) {
+// closeLegFor closes resources belonging to owner; nil means unconditional cleanup.
+func (a *app) closeLegFor(owner *bridge.Session, reason string) {
+	a.callMu.Lock()
+	defer a.callMu.Unlock()
+	if owner != nil && a.resourceSession != owner {
+		return
+	}
+	s := a.resourceSession
+	a.resourceSession = nil
 	a.mu.Lock()
 	leg, gate := a.leg, a.gate
 	a.leg, a.gate = nil, nil
-	s := a.sess
 	a.mu.Unlock()
 	if s != nil {
 		s.SetAudioSink(nil)
@@ -616,6 +630,35 @@ func (a *app) closeLeg(reason string) {
 	recIn.Close()
 	recOut.Close()
 	bridge.FlushWriteMeters()
+}
+
+// retireSession invalidates an in-flight dial before resource cleanup can block.
+func (a *app) retireSession(s *bridge.Session) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sess != s {
+		return false
+	}
+	a.sess = nil
+	return true
+}
+
+// admitOffer is called after the current-call repeat check, with offerMu held.
+func (a *app) admitOffer(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.seenOffers == nil {
+		a.seenOffers = make(map[string]time.Time)
+	}
+	for key, at := range a.seenOffers {
+		if time.Since(at) > 5*time.Minute {
+			delete(a.seenOffers, key)
+		}
+	}
+	if _, seen := a.seenOffers[id]; seen {
+		return errors.New("this offer belongs to an ended or changed session")
+	}
+	return nil
 }
 
 // whereAndWhen tells the assistant where the Echo is and what time it is there.
@@ -812,17 +855,23 @@ func (a *app) liveAge() time.Duration {
 	return leg.Age()
 }
 
-func (a *app) teardown(reason string) {
+func (a *app) teardown(reason string) { a.teardownFor(nil, reason) }
+
+func (a *app) teardownFor(expected *bridge.Session, reason string) {
 	// The session leaves the app FIRST. A dial that returns while the rest of this runs then finds
 	// it gone and closes what it built, instead of installing a leg into a call that is ending.
 	a.mu.Lock()
+	if expected != nil && a.sess != expected {
+		a.mu.Unlock()
+		return
+	}
 	s := a.sess
 	a.sess = nil
 	a.mu.Unlock()
 	if s != nil {
 		s.SetAudioSink(nil)
 	}
-	a.closeLeg(reason)
+	a.closeLegFor(s, reason)
 	if s != nil {
 		s.Close(reason)
 	}
@@ -835,7 +884,7 @@ func (a *app) watchdog(s *bridge.Session) {
 	a.mu.Unlock()
 	if cur == s {
 		a.ev("max_session_reached", "max", a.maxSess.String())
-		a.teardown("max_session")
+		a.teardownFor(s, "max_session")
 	}
 }
 
@@ -864,7 +913,7 @@ func (a *app) Disconnected(id string) {
 	// Close the OpenAI side at once so the clock stops; hold the Echo transport briefly to
 	// observe whether Amazon keeps sending after its own directive.
 	s.SetAudioSink(nil)
-	a.closeLeg("alexa_disconnected")
+	a.closeLegFor(s, "alexa_disconnected")
 	go func() {
 		if a.holdFor > 0 {
 			a.ev("hold_after_disconnect", "seconds", a.holdFor.Seconds())
@@ -1261,8 +1310,9 @@ func (a *app) watchFarewell(leg *bridge.LiveLeg, f *bridge.Farewell) {
 	for range t.C {
 		a.mu.Lock()
 		cur := a.leg
+		session := a.sess
 		a.mu.Unlock()
-		if cur != leg {
+		if cur != leg || session == nil {
 			return // this call is over; the watcher belongs to it
 		}
 		phrase, at, armed := f.Armed()
@@ -1287,13 +1337,19 @@ func (a *app) watchFarewell(leg *bridge.LiveLeg, f *bridge.Farewell) {
 		case replied && quiet < a.byeGrace && waited < farewellMaxWait:
 			continue // still saying her own goodbye; let her finish
 		}
+		a.mu.Lock()
+		if a.leg != leg || a.sess != session {
+			a.mu.Unlock()
+			return
+		}
 		f.Disarm()
+		a.mu.Unlock()
 		a.ev("farewell_close", "phrase", phrase, "grace_s", a.byeGrace.Seconds(), "replied", replied,
 			"quiet_s", quiet.Seconds(), "waited_s", waited.Seconds(),
 			"note", "she finished, so the whole call ends: OpenAI stops billing and the Echo transport is dropped; whether Alexa then ends the call on the device is not yet known")
 		// teardown, not closeLeg: the Echo session goes down too, so Alexa ends the call instead of
 		// leaving him holding an open line.
-		a.teardown("farewell")
+		a.teardownFor(session, "farewell")
 		return
 	}
 }

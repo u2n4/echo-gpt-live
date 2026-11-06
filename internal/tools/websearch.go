@@ -483,7 +483,10 @@ func get(ctx context.Context, client *http.Client, u string, limit int64, hdr ma
 		return nil, err
 	}
 	defer res.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(res.Body, limit))
+	body, err := io.ReadAll(io.LimitReader(res.Body, limit))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
 	if res.StatusCode >= 400 {
 		return nil, fmt.Errorf("answered %d", res.StatusCode)
 	}

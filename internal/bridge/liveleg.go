@@ -19,6 +19,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -73,8 +74,7 @@ type LiveLeg struct {
 	endedAt         atomic.Int64 // unix nanos when Close ran; Age freezes there
 	firstIn         atomic.Int64 // ms after dial
 	lastVoice       atomic.Int64 // unix nanos of the last packet that carried speech, not silence
-	srPackets       atomic.Int64 // OpenAI's sender report: packets it says it has sent
-	srAt            atomic.Int64 // unix nanos of that report
+	senderReport    atomic.Pointer[liveSenderReport]
 	started         time.Time
 	closeOnce       sync.Once
 
@@ -716,8 +716,7 @@ func (l *LiveLeg) drainRTCP(rc *webrtc.RTPReceiver, ev Events) {
 				// RTP packet arrived in a hundred seconds while the transcript said she was
 				// answering the whole time; whether her audio was never sent or sent and lost on
 				// the way is exactly what this number settles, and it was not being kept.
-				l.srPackets.Store(int64(v.PacketCount))
-				l.srAt.Store(time.Now().UnixNano())
+				l.senderReport.Store(&liveSenderReport{packets: int64(v.PacketCount), at: time.Now()})
 			}
 		}
 	}
@@ -746,25 +745,26 @@ func (l *LiveLeg) BelowTheReader() (packets uint64, lastAgo time.Duration) {
 // SenderReport returns OpenAI's latest claim of how many RTP packets it has sent, and when it
 // said so. Zero and the zero time if it has not reported yet.
 func (l *LiveLeg) SenderReport() (packets int64, at time.Time) {
-	ns := l.srAt.Load()
-	if ns == 0 {
+	report := l.senderReport.Load()
+	if report == nil {
 		return 0, time.Time{}
 	}
-	return l.srPackets.Load(), time.Unix(0, ns)
+	return report.packets, report.at
+}
+
+type liveSenderReport struct {
+	packets int64
+	at      time.Time
 }
 
 func eventType(b []byte) string {
-	// A tiny scan instead of a full unmarshal: this runs on every data-channel message.
-	const key = `"type":"`
-	i := strings.Index(string(b), key)
-	if i < 0 {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(b, &event) != nil || len(event.Type) > 128 {
 		return ""
 	}
-	rest := string(b)[i+len(key):]
-	if j := strings.IndexByte(rest, '"'); j > 0 {
-		return rest[:j]
-	}
-	return ""
+	return event.Type
 }
 
 func summarizeLiveAnswer(ev Events, sdp string) {

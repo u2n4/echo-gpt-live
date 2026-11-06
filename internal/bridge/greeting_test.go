@@ -56,8 +56,12 @@ func TestPlayGreetingWritesOneContinuousTalkspurt(t *testing.T) {
 	}
 	var s TimelineSplice
 	var got []*rtp.Packet
-	started := time.Now()
-	n, err := PlayGreeting(context.Background(), path, func(p *rtp.Packet) error { got = append(got, p); return nil }, &s)
+	var sentAt []time.Time
+	n, err := PlayGreeting(context.Background(), path, func(p *rtp.Packet) error {
+		got = append(got, p)
+		sentAt = append(sentAt, time.Now())
+		return nil
+	}, &s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +82,7 @@ func TestPlayGreetingWritesOneContinuousTalkspurt(t *testing.T) {
 			t.Fatalf("timestamp step at %d is %d, want 960", i, got[i].Timestamp-got[i-1].Timestamp)
 		}
 	}
-	if el := time.Since(started); el < time.Duration(n-1)*20*time.Millisecond {
+	if el := sentAt[len(sentAt)-1].Sub(sentAt[0]); el < time.Duration(n-1)*20*time.Millisecond-time.Millisecond {
 		t.Fatalf("%d packets left in %v; the greeting must be paced, not burst", n, el)
 	}
 	// the splice now continues from the last packet
@@ -86,5 +90,8 @@ func TestPlayGreetingWritesOneContinuousTalkspurt(t *testing.T) {
 	s.Translate(next)
 	if next.SequenceNumber != got[len(got)-1].SequenceNumber+1 {
 		t.Fatalf("OpenAI's first packet should follow the greeting's last, got %d after %d", next.SequenceNumber, got[len(got)-1].SequenceNumber)
+	}
+	if step := int64(int32(next.Timestamp - got[len(got)-1].Timestamp)); step < 960 || step > 48000 {
+		t.Fatalf("post-greeting timestamp step = %d ticks", step)
 	}
 }

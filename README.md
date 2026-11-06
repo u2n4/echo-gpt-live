@@ -111,6 +111,11 @@ defaults to empty (off) and should remain off unless testing. Other flags people
 the call), `--memory-file`, `--vault-url` + `cmd/vaultd` for notes, `--home-endpoints` for
 read-only things on your LAN, `--record-dir` to keep both audio directions as Ogg/Opus.
 
+The notes service defaults to loopback HTTP. For access from another machine, use
+`vaultd --tls-cert <certificate> --tls-key <private-key>` and an HTTPS `--vault-url`,
+or terminate TLS at a trusted proxy to the loopback service. Non-loopback plaintext
+vault connections and URLs containing embedded credentials are refused.
+
 ### 3. Deploy the Lambda and the skill
 
 ```bash
@@ -174,7 +179,7 @@ cmd/bridge       the service (main.go: flags, call lifecycle; assist.go/confirm.
 cmd/answertest   router + tool latency benchmark without opening a live voice call
 cmd/echosim      an Alexa-shaped WebRTC client for tests without an Echo
 cmd/openaitest   one OpenAI live session from the command line, with timing and transcript
-cmd/vaultd       tiny HTTP agent that serves your notes folder to the bridge (search + append)
+cmd/vaultd       tiny HTTPS agent (loopback HTTP allowed) for notes search + append
 cmd/rtcdiag      the original Echo-side experiment harness
 internal/bridge  Pion peer for the Echo (peer.go), the OpenAI leg (liveleg.go), hold/pacer/sequence rebase, farewell detector, recording
 internal/openai  live session client, sideband websocket, budget, ledger, router model

@@ -2,6 +2,8 @@ package openai
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -22,6 +24,7 @@ func silentAfterServer(t *testing.T, eventsPerSocket int, sockets *atomic.Int64)
 			return
 		}
 		n := sockets.Add(1)
+		defer conn.CloseNow()
 		ctx := r.Context()
 		for i := 0; i < eventsPerSocket; i++ {
 			msg := `{"type":"session.input_audio.append","socket":` + itoa(n) + `}`
@@ -29,8 +32,39 @@ func silentAfterServer(t *testing.T, eventsPerSocket int, sockets *atomic.Int64)
 				return
 			}
 		}
-		<-ctx.Done() // silent, open, forever
+		<-conn.CloseRead(ctx).Done() // detect peer close on the hijacked connection
 	}))
+}
+
+func TestSidebandCloseRejectsInflightReattach(t *testing.T) {
+	var sockets atomic.Int64
+	srv := silentAfterServer(t, 0, &sockets)
+	defer srv.Close()
+	c := liveClientAt(srv)
+	sb, err := c.Attach(context.Background(), "live_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := c.HTTP.Transport
+	entered, release := make(chan struct{}), make(chan struct{})
+	c.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		close(entered)
+		<-release
+		return base.RoundTrip(r)
+	})
+	finished := make(chan error, 1)
+	go func() { finished <- sb.Reattach(context.Background()) }()
+	<-entered
+	if err := sb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-finished; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Reattach after Close: %v", err)
+	}
+	if sb.Attached() != 1 {
+		t.Fatal("closed sideband installed a replacement socket")
+	}
 }
 
 // Silence is measured, a kick makes a blocked Read return, and a reattach brings a fresh socket

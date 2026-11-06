@@ -49,7 +49,11 @@ func TestExcerptListsMoneyWithItsLabel(t *testing.T) {
 	if !strings.Contains(out, "Series 2 — 769.00 SAR") {
 		t.Errorf("number-then-currency should be found too: %q", out)
 	}
-	money := out[strings.Index(out, "Money on the page:"):strings.Index(out, "\nText:")]
+	start, end := strings.Index(out, "Money on the page:"), strings.Index(out, "\nText:")
+	if start < 0 || end <= start {
+		t.Fatalf("money/text sections missing: %q", out)
+	}
+	money := out[start:end]
 	if strings.Count(money, "SAR 224.95") != 1 {
 		t.Errorf("a repeated listing is one entry: %q", money)
 	}

@@ -34,6 +34,7 @@ func Prayer(lat, lon float64, tz string, client *http.Client) *Tool {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
 	c := &prayerCache{}
+	loc, zoneErr := time.LoadLocation(tz)
 	return &Tool{
 		Name: "prayer_times",
 		Description: "Today's prayer times where he lives: Fajr, Sunrise, Dhuhr, Asr, " +
@@ -44,7 +45,11 @@ func Prayer(lat, lon float64, tz string, client *http.Client) *Tool {
 		Ambient: true,
 		Timeout: 6 * time.Second,
 		Run: func(ctx context.Context, _ map[string]any) (string, error) {
-			day := time.Now().Format("02-01-2006")
+			if zoneErr != nil {
+				return "", fmt.Errorf("invalid prayer timezone: %w", zoneErr)
+			}
+			now := time.Now().In(loc)
+			day := now.Format("02-01-2006")
 			c.mu.Lock()
 			cached := c.data
 			cachedDay := c.day
@@ -70,18 +75,22 @@ func Prayer(lat, lon float64, tz string, client *http.Client) *Tool {
 				cached = c.data
 				c.mu.Unlock()
 			}
-			return prayerSentence(cached), nil
+			return prayerSentenceAt(cached, now), nil
 		},
 	}
 }
 
 func prayerSentence(t map[string]string) string {
+	return prayerSentenceAt(t, time.Now())
+}
+
+func prayerSentenceAt(t map[string]string, at time.Time) string {
 	order := []string{"Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"}
 	names := map[string]string{
 		"Fajr": "الفجر", "Sunrise": "الشروق", "Dhuhr": "الظهر",
 		"Asr": "العصر", "Maghrib": "المغرب", "Isha": "العشاء",
 	}
-	now := time.Now().Format("15:04")
+	now := at.Format("15:04")
 	next := ""
 	for _, k := range order {
 		if v := trimTime(t[k]); v != "" && v > now {

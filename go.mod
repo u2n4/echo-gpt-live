@@ -26,7 +26,7 @@ require (
 	github.com/pion/transport/v5 v5.1.4 // indirect
 	github.com/pion/turn/v5 v5.1.3 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/crypto v0.58.1-0.20261105095718-a1058eb15227 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 )

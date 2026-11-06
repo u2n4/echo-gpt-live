@@ -44,6 +44,9 @@ func RememberThis(m Memory) *Tool {
 			if fact == "" {
 				return "", fmt.Errorf("there is nothing to remember")
 			}
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			if err := m.Remember(fact); err != nil {
 				return "", fmt.Errorf("it could not be saved: %w", err)
 			}
@@ -64,6 +67,7 @@ func WhatYouKnow(m Memory) *Tool {
 		Timeout: 2 * time.Second,
 		Run: func(ctx context.Context, _ map[string]any) (string, error) {
 			f := m.Facts()
+			total := len(f)
 			if len(f) == 0 {
 				return "Nothing is saved about him yet.", nil
 			}
@@ -71,7 +75,7 @@ func WhatYouKnow(m Memory) *Tool {
 				f = f[len(f)-12:]
 			}
 			return fmt.Sprintf("%d things are saved. The most recent: %s",
-				len(m.Facts()), strings.Join(f, "; ")), nil
+				total, strings.Join(f, "; ")), nil
 		},
 	}
 }

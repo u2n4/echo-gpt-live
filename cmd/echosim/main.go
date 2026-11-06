@@ -10,12 +10,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,21 +37,36 @@ func must(err error) {
 	}
 }
 
-func post(base string, key []byte, path string, v any) (int, []byte) {
-	body, _ := json.Marshal(v)
+func post(base string, key []byte, path string, v any) (int, []byte, error) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return 0, nil, err
+	}
 	ts, sig := alexa.Sign(key, body)
-	req, _ := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-ACV-Timestamp", ts)
 	req.Header.Set("X-ACV-Signature", sig)
 	res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	must(err)
+	if err != nil {
+		return 0, nil, err
+	}
 	defer res.Body.Close()
-	b, _ := io.ReadAll(res.Body)
-	return res.StatusCode, b
+	b, err := io.ReadAll(res.Body)
+	return res.StatusCode, b, err
 }
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	base := flag.String("url", "http://127.0.0.1:8787", "rtcdiag signaling base URL")
 	keyFile := flag.String("key-file", os.ExpandEnv("$HOME/.config/acv/signing.key"), "shared HMAC key")
 	dur := flag.Duration("duration", 40*time.Second, "how long to keep the session before sending disconnected")
@@ -72,6 +89,7 @@ func main() {
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	must(err)
+	defer pc.Close()
 
 	audio, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1"}, "audio", "blackbird")
 	must(err)
@@ -85,9 +103,9 @@ func main() {
 	var inPkts, inVideo atomic.Int64
 	var seqJumps, tsJumps atomic.Int64
 	var firstIn atomic.Int64
-	states := []string{}
+	states := &stateHistory{}
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
-		states = append(states, s.String())
+		states.add(s.String())
 		fmt.Fprintln(os.Stderr, "[echosim] ice", s)
 	})
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) { fmt.Fprintln(os.Stderr, "[echosim] pc", s) })
@@ -138,24 +156,44 @@ func main() {
 	sdp := pc.LocalDescription().SDP
 	sid := uuid.NewString()
 	t0 := time.Now()
-	code, body := post(*base, key, "/rtc/offer", map[string]any{"v": 1, "type": "offer", "sessionId": sid, "sdp": sdp, "ts": float64(time.Now().UnixNano()) / 1e9, "nonce": uuid.NewString()})
+	code, body, err := post(*base, key, "/rtc/offer", map[string]any{"v": 1, "type": "offer", "sessionId": sid, "sdp": sdp, "ts": float64(time.Now().UnixNano()) / 1e9, "nonce": uuid.NewString()})
 	answerMs := time.Since(t0).Milliseconds()
-	if code != 200 {
-		fmt.Fprintf(os.Stderr, "[echosim] offer rejected: %d %s\n", code, body)
-		os.Exit(1)
+	if err != nil {
+		return err
 	}
+	if code != 200 {
+		return fmt.Errorf("offer rejected: HTTP %d", code)
+	}
+	var disconnectOnce sync.Once
+	disconnect := func() {
+		disconnectOnce.Do(func() {
+			var derr error
+			code, _, derr = post(*base, key, "/rtc/disconnected", map[string]any{"v": 1, "type": "disconnected", "sessionId": sid, "ts": float64(time.Now().UnixNano()) / 1e9, "nonce": uuid.NewString()})
+			if derr != nil {
+				fmt.Fprintln(os.Stderr, "disconnect:", derr)
+			}
+		})
+	}
+	defer disconnect()
+
 	var ans struct {
 		SDP string `json:"sdp"`
 	}
-	must(json.Unmarshal(body, &ans))
-	must(pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP}))
+	if err := json.Unmarshal(body, &ans); err != nil {
+		return err
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP}); err != nil {
+		return err
+	}
 
 	// send audio from file at real time
 	ctx, cancel := context.WithTimeout(context.Background(), *dur)
 	defer cancel()
 	var outPkts atomic.Int64
 	var writeFails atomic.Int64
+	audioDone := make(chan struct{})
 	go func() {
+		defer close(audioDone)
 		quietAt := time.Time{}
 		if *speakFor > 0 {
 			quietAt = time.Now().Add(*speakFor)
@@ -173,32 +211,49 @@ func main() {
 			ogg, _, err := oggreader.NewWith(f)
 			if err != nil {
 				f.Close()
+				fmt.Fprintln(os.Stderr, "invalid Ogg:", err)
 				return
 			}
 			tk := time.NewTicker(20 * time.Millisecond)
+			passPackets := 0
 			for ctx.Err() == nil {
 				if !quietAt.IsZero() && time.Now().After(quietAt) {
 					break
 				}
 				p, _, err := ogg.ParseNextPage()
 				if err != nil {
+					if !errors.Is(err, io.EOF) {
+						tk.Stop()
+						f.Close()
+						fmt.Fprintln(os.Stderr, "corrupt Ogg:", err)
+						return
+					}
 					break
 				}
 				if len(p) > 0 {
+					passPackets++
 					if err := audio.WriteSample(media.Sample{Data: p, Duration: 20 * time.Millisecond}); err != nil {
 						writeFails.Add(1)
 					} else {
 						outPkts.Add(1)
 					}
 				}
-				<-tk.C
+				select {
+				case <-tk.C:
+				case <-ctx.Done():
+				}
 			}
 			tk.Stop()
 			f.Close()
+			if passPackets == 0 {
+				fmt.Fprintln(os.Stderr, "Ogg contains no audio packets")
+				return
+			}
 		}
 	}()
 	<-ctx.Done()
-	code, _ = post(*base, key, "/rtc/disconnected", map[string]any{"v": 1, "type": "disconnected", "sessionId": sid, "ts": float64(time.Now().UnixNano()) / 1e9, "nonce": uuid.NewString()})
+	<-audioDone
+	disconnect()
 	time.Sleep(500 * time.Millisecond)
 	if err := pc.Close(); err != nil {
 		fmt.Fprintln(os.Stderr, "[echosim] pc close:", err)
@@ -217,14 +272,35 @@ func main() {
 			lines = append(lines, ln)
 		}
 	}
+	firstMs := int64(-1)
+	if at := firstIn.Load(); at != 0 {
+		firstMs = at - t0.UnixMilli()
+	}
 	out, err := json.MarshalIndent(map[string]any{
 		"sessionId": sid, "answer_status": 200, "answer_ms": answerMs, "disconnect_status": code,
-		"ice_states": states, "audio_pkts_sent": outPkts.Load(), "audio_pkts_received": inPkts.Load(), "audio_seq_jumps": seqJumps.Load(), "audio_ts_jumps": tsJumps.Load(), "video_pkts_received": inVideo.Load(),
-		"first_audio_in_ms_after_offer": firstIn.Load() - t0.UnixMilli(), "answer_lines": lines,
+		"ice_states": states.snapshot(), "audio_pkts_sent": outPkts.Load(), "audio_pkts_received": inPkts.Load(), "audio_seq_jumps": seqJumps.Load(), "audio_ts_jumps": tsJumps.Load(), "video_pkts_received": inVideo.Load(),
+		"first_audio_in_ms_after_offer": firstMs, "answer_lines": lines,
 	}, "", "  ")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "[echosim] summary:", err)
-		os.Exit(1)
+		return fmt.Errorf("summary: %w", err)
 	}
 	fmt.Println(string(out))
+	return nil
+}
+
+// stateHistory is shared by Pion callbacks and the final summary.
+type stateHistory struct {
+	mu     sync.Mutex
+	states []string
+}
+
+func (s *stateHistory) add(state string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.states = append(s.states, state)
+}
+func (s *stateHistory) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.states...)
 }

@@ -99,12 +99,24 @@ def main():
         for e in sess:
             if e["ev"] in ("stats_1s", "stats_final", "session_close"):
                 vid_sent = max(vid_sent, e.get("video_frames_sent", 0) or 0)
+        def offset(e):
+            if not e:
+                return None
+            value = e.get("since_answer_ms")
+            if value is None and answer_ms is not None and e.get("mono_ms") is not None:
+                value = e["mono_ms"] - answer_ms
+            return None if value is None else value / 1000
+
+        def at(e, absent):
+            value = offset(e)
+            return absent if value is None else f"{value:+.2f}s after answer"
+
         print("\n   VERDICT")
-        print(f"     SessionConnected from Alexa : {'YES at %+.2fs' % (conn['since_answer_ms'] / 1000) if conn else 'no (Amazon docs: not always sent)'}")
-        print(f"     inbound audio started       : {'%+.2fs after answer' % (first_in['since_answer_ms'] / 1000) if first_in else 'NEVER'}")
+        print(f"     SessionConnected from Alexa : {at(conn, 'no timestamp' if conn else 'no (Amazon docs: not always sent)')}")
+        print(f"     inbound audio started       : {at(first_in, 'no timestamp' if first_in else 'NEVER')}")
         print(f"     video frames we sent        : {vid_sent}")
-        if disc:
-            secs = disc["since_answer_ms"] / 1000
+        if offset(disc) is not None:
+            secs = offset(disc)
             base = "matches the July baseline (26-28 s) -> video did NOT change the outcome" if 24 <= secs <= 32 \
                 else ("LONGER than the July baseline -> the video hypothesis is supported" if secs > 32
                       else "SHORTER than the July baseline -> different failure, inspect above")

@@ -194,9 +194,9 @@ func (p *Profile) Forget() error {
 // profile intact rather than half a profile.
 func (p *Profile) save() error {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	facts := append([]string(nil), p.facts...)
 	path := p.path
-	p.mu.Unlock()
 
 	if path == "" {
 		return nil
@@ -211,8 +211,17 @@ func (p *Profile) save() error {
 	for _, f := range facts {
 		b.WriteString("- " + f + "\n")
 	}
-	tmp := fmt.Sprintf("%s.tmp%d", path, os.Getpid())
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".memory-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

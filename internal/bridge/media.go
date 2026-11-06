@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,7 @@ func playOggOpus(ctx context.Context, path string, track *webrtc.TrackLocalStati
 			return
 		}
 		var lastGranule uint64
+		packets := 0
 		ticker := time.NewTicker(20 * time.Millisecond)
 		for ctx.Err() == nil {
 			payload, hdr, err := ogg.ParseNextPage()
@@ -40,8 +42,10 @@ func playOggOpus(ctx context.Context, path string, track *webrtc.TrackLocalStati
 				break
 			}
 			if err != nil {
+				ticker.Stop()
+				_ = f.Close()
 				onErr(err)
-				break
+				return
 			}
 			// granule positions are 48 kHz sample counts
 			n := hdr.GranulePosition - lastGranule
@@ -53,8 +57,12 @@ func playOggOpus(ctx context.Context, path string, track *webrtc.TrackLocalStati
 			if len(payload) == 0 {
 				continue
 			}
+			packets++
 			if err := track.WriteSample(media.Sample{Data: payload, Duration: dur}); err != nil {
+				ticker.Stop()
+				_ = f.Close()
 				onErr(err)
+				return
 			}
 			select {
 			case <-ctx.Done():
@@ -63,6 +71,10 @@ func playOggOpus(ctx context.Context, path string, track *webrtc.TrackLocalStati
 		}
 		ticker.Stop()
 		_ = f.Close()
+		if packets == 0 && ctx.Err() == nil {
+			onErr(errors.New("ogg file contains no audio packets"))
+			return
+		}
 	}
 }
 
@@ -90,6 +102,7 @@ func playH264(ctx context.Context, path string, fps float64, track *webrtc.Track
 		au := aus[i%len(aus)]
 		if err := track.WriteSample(media.Sample{Data: au, Duration: frameDur}); err != nil {
 			onErr(err)
+			return
 		}
 		n++
 		if onFrame != nil {
@@ -143,10 +156,13 @@ func loadAccessUnits(path string) ([][]byte, error) {
 
 // reflector forwards received audio RTP back to the local track after an optional delay.
 type reflector struct {
-	track   *webrtc.TrackLocalStaticRTP
-	delay   time.Duration
-	ch      chan delayed
-	dropped atomic.Int64
+	track    *webrtc.TrackLocalStaticRTP
+	delay    time.Duration
+	ch       chan delayed
+	dropped  atomic.Int64
+	done     chan struct{}
+	stopped  chan struct{}
+	stopOnce sync.Once
 }
 
 type delayed struct {
@@ -155,12 +171,17 @@ type delayed struct {
 }
 
 func newReflector(track *webrtc.TrackLocalStaticRTP, delay time.Duration) *reflector {
-	r := &reflector{track: track, delay: delay, ch: make(chan delayed, 1024)}
+	r := &reflector{track: track, delay: delay, ch: make(chan delayed, 1024), done: make(chan struct{}), stopped: make(chan struct{})}
 	go r.run()
 	return r
 }
 
 func (r *reflector) push(p *rtp.Packet) {
+	select {
+	case <-r.done:
+		return
+	default:
+	}
 	select {
 	case r.ch <- delayed{at: time.Now().Add(r.delay), pkt: p}:
 	default: // drop if the delay buffer is full; never block the receive loop
@@ -169,9 +190,22 @@ func (r *reflector) push(p *rtp.Packet) {
 }
 
 func (r *reflector) run() {
-	for d := range r.ch {
+	defer close(r.stopped)
+	for {
+		var d delayed
+		select {
+		case <-r.done:
+			return
+		case d = <-r.ch:
+		}
 		if w := time.Until(d.at); w > 0 {
-			time.Sleep(w)
+			timer := time.NewTimer(w)
+			select {
+			case <-r.done:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 		// Pion rewrites SSRC and payload type to the local track's binding; the
 		// Opus payload, sequence number, timestamp and marker are forwarded unchanged.
@@ -185,7 +219,10 @@ func (r *reflector) run() {
 // Dropped reports reflector packets lost to a full buffer or a dead track.
 func (r *reflector) Dropped() int64 { return r.dropped.Load() }
 
-func (r *reflector) close() { close(r.ch) }
+func (r *reflector) close() {
+	r.stopOnce.Do(func() { close(r.done) })
+	<-r.stopped
+}
 
 // PlayOggOnce streams an Ogg/Opus file once, in real time, into a sample track.
 // Exported for the OpenAI leg test, which speaks one utterance then listens.
@@ -228,6 +265,7 @@ func PlayOggOnce(ctx context.Context, path string, track *webrtc.TrackLocalStati
 		if len(payload) > 0 {
 			if err := track.WriteSample(media.Sample{Data: payload, Duration: dur}); err != nil {
 				onErr(err)
+				return
 			}
 		}
 		sent += dur

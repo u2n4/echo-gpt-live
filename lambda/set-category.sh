@@ -11,6 +11,7 @@
 #   aws login --profile alexa-chatgpt-voice --region us-east-1
 set -euo pipefail
 CATS="${1:?usage: set-category.sh CAMERA|DOORBELL|CAMERA,DOORBELL [--no-endpoint-health]}"
+case "$CATS" in CAMERA|DOORBELL|CAMERA,DOORBELL|DOORBELL,CAMERA) ;; *) echo "invalid display categories" >&2; exit 2;; esac
 HEALTH=1
 [ "${2:-}" = "--no-endpoint-health" ] && HEALTH=0
 PROFILE=alexa-chatgpt-voice
@@ -20,14 +21,14 @@ AWS=(aws --profile "$PROFILE" --region "$REGION")
 
 cur=$("${AWS[@]}" lambda get-function-configuration --function-name "$FN" \
         --query 'Environment.Variables' --output json)
-echo "current env: $(echo "$cur" | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:("<redacted>" if "KEY" in k else v) for k,v in d.items()})')"
+echo "current env: $(echo "$cur" | python3 -c 'import json,sys; d=json.load(sys.stdin) or {}; print({k:("<redacted>" if "KEY" in k else v) for k,v in d.items()})')"
 new=$(echo "$cur" | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-d['ACV_DISPLAY_CATEGORIES']='$CATS'
-d['ACV_ENDPOINT_HEALTH']='$HEALTH'
+d=json.load(sys.stdin) or {}
+d['ACV_DISPLAY_CATEGORIES']=sys.argv[1]
+d['ACV_ENDPOINT_HEALTH']=sys.argv[2]
 print(json.dumps({'Variables': d}))
-")
+" "$CATS" "$HEALTH")
 "${AWS[@]}" lambda update-function-configuration --function-name "$FN" \
   --environment "$new" --query 'LastUpdateStatus' --output text
 "${AWS[@]}" lambda wait function-updated --function-name "$FN"

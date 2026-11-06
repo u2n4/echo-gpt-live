@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local loopback matrix: echosim (Amazon-like offer) -> rtcdiag, one run per video mode.
 # Usage: scripts/localtest.sh [seconds] [extra rtcdiag flags...]
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 SECS="${1:-12}"; shift || true
 mkdir -p runs
@@ -12,18 +12,18 @@ mkdir -p runs
 # already. Both sides are pinned to a port proven free before anything starts.
 source "$ROOT/scripts/lib/safe-port.sh"
 DIAG_PORT="$(pick_free_port 8811)"
+UDP="$(pick_free_port 50020 udp)"
+RD=""
+trap 'stop_child "$RD"' EXIT
 assert_not_live "$DIAG_PORT"
 echo "diagnostics on 127.0.0.1:$DIAG_PORT (the live bridge is on 8787 and is not being touched)"
 
 for mode in inactive reject sendonly recvonly; do
   name="local-$mode-$(date -u +%H%M%S)"
-  ./bin/rtcdiag --run "$name" --listen "127.0.0.1:$DIAG_PORT" --udp-port 50000 --stun "" --video "$mode" --audio reflect --hold-after-disconnect 2s "$@" > "runs/$name.stdout" 2>&1 &
+  ./bin/rtcdiag "$@" --run "$name" --listen "127.0.0.1:$DIAG_PORT" --udp-port "$UDP" --stun "" --video "$mode" --audio reflect --hold-after-disconnect 2s > "runs/$name.stdout" 2>&1 &
   RD=$!
-  sleep 1
-  # Prove rtcdiag is the thing on that port before sending it an offer.
-  if ! ss -lnt "sport = :$DIAG_PORT" 2>/dev/null | grep -q ":$DIAG_PORT"; then
+  if ! wait_owned_tcp "$RD" "$DIAG_PORT"; then
     echo "rtcdiag never listened on $DIAG_PORT; refusing to send an offer that could land elsewhere" >&2
-    kill -INT $RD 2>/dev/null; wait $RD 2>/dev/null
     exit 3
   fi
   echo "=============== video=$mode"
@@ -33,7 +33,7 @@ d=json.load(sys.stdin)
 print("answer_ms", d["answer_ms"], "| ice", d["ice_states"], "| audio out/in", d["audio_pkts_sent"], d["audio_pkts_received"], "| video in", d["video_pkts_received"], "| first_in_ms", d["first_audio_in_ms_after_offer"])
 for l in d["answer_lines"]: print("   ", l)
 '
-  kill -INT $RD 2>/dev/null; wait $RD 2>/dev/null
+  stop_child "$RD"; RD=""
   python3 - "runs/$name/events.jsonl" <<'PY'
 import json,sys
 evs=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]

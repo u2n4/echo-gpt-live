@@ -372,7 +372,7 @@ func fetchPage(ctx context.Context, client *http.Client, page string) (string, e
 		return "", fmt.Errorf("not a page (%s)", strings.SplitN(ct, ";", 2)[0])
 	}
 	body, err := io.ReadAll(io.LimitReader(res.Body, pageLimit))
-	if err != nil && len(body) == 0 {
+	if err != nil {
 		return "", err
 	}
 	return htmlToText(string(body)), nil

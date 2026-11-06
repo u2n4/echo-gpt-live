@@ -5,6 +5,8 @@
 # Uses an explicit named profile + region on EVERY call (never the default profile).
 set -euo pipefail
 
+SKILL_ID="${1:?a Smart Home skill ID is required}"
+[[ "$SKILL_ID" =~ ^amzn1\.ask\.skill\.[A-Za-z0-9-]+$ ]] || { echo "invalid skill ID" >&2; exit 2; }
 REGION="us-east-1"                 # ar-SA + en-US -> North America -> us-east-1
 PROFILE="alexa-chatgpt-voice"
 export AWS_PROFILE="$PROFILE" AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"
@@ -38,6 +40,7 @@ ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
 # 2. package (single-file ES module)
 TMP="$(mktemp -d)"
+trap 'rm -rf -- "$TMP"' EXIT
 cp "$ROOT/lambda/index.mjs" "$TMP/"
 ( cd "$TMP" && zip -q function.zip index.mjs )
 
@@ -75,27 +78,30 @@ case "$LIVE_CATS" in ""|None) LIVE_CATS="CAMERA";; esac
 DISPLAY_CATS="${ACV_DISPLAY_CATEGORIES:-$LIVE_CATS}"
 
 echo "friendly name: $FRIENDLY_NAME   display categories: $DISPLAY_CATS"
+export SIGNING_KEY UBUNTU_URL FRIENDLY_NAME DISPLAY_CATS
+python3 - >"$TMP/environment.json" <<'PYENV'
+import json, os
+print(json.dumps({"Variables": {
+    "ACV_UBUNTU_URL": os.environ["UBUNTU_URL"],
+    "ACV_SIGNING_KEY": os.environ["SIGNING_KEY"],
+    "ACV_ENDPOINT_ID": "acv-chatgpt-voice-1",
+    "ACV_FRIENDLY_NAME": os.environ["FRIENDLY_NAME"],
+    "ACV_DISPLAY_CATEGORIES": os.environ["DISPLAY_CATS"],
+}}))
+PYENV
+chmod 600 "$TMP/environment.json"
 "${AWS[@]}" lambda update-function-configuration --function-name "$FN_NAME" \
-  --environment "Variables={ACV_UBUNTU_URL=$UBUNTU_URL,ACV_SIGNING_KEY=$SIGNING_KEY,ACV_ENDPOINT_ID=acv-chatgpt-voice-1,ACV_FRIENDLY_NAME=$FRIENDLY_NAME,ACV_DISPLAY_CATEGORIES=$DISPLAY_CATS}" \
-  >/dev/null
+  --environment "file://$TMP/environment.json" >/dev/null
 echo "set environment (secret redacted)"
 
 # 5. allow Alexa Smart Home to invoke it.
 #    If a Skill ID is provided as $1, restrict the trigger to that exact skill (least privilege).
-SKILL_ID="${1:-}"
 "${AWS[@]}" lambda remove-permission --function-name "$FN_NAME" --statement-id alexa-smarthome 2>/dev/null || true
-if [ -n "$SKILL_ID" ]; then
-  "${AWS[@]}" lambda add-permission --function-name "$FN_NAME" \
-    --statement-id alexa-smarthome --action lambda:InvokeFunction \
-    --principal alexa-connectedhome.amazon.com \
-    --event-source-token "$SKILL_ID" >/dev/null
-  echo "alexa trigger restricted to skill $SKILL_ID"
-else
-  "${AWS[@]}" lambda add-permission --function-name "$FN_NAME" \
-    --statement-id alexa-smarthome --action lambda:InvokeFunction \
-    --principal alexa-connectedhome.amazon.com >/dev/null
-  echo "alexa trigger added (unrestricted — re-run with SKILL_ID to lock down)"
-fi
+"${AWS[@]}" lambda add-permission --function-name "$FN_NAME" \
+  --statement-id alexa-smarthome --action lambda:InvokeFunction \
+  --principal alexa-connectedhome.amazon.com \
+  --event-source-token "$SKILL_ID" >/dev/null
+echo "alexa trigger restricted to the configured skill"
 
 ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FN_NAME}"
 echo
@@ -110,6 +116,5 @@ iam_role=$ROLE_NAME
 iam_policy_attached=arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 log_group=/aws/lambda/$FN_NAME
 EOR
-rm -rf "$TMP"
 echo "saved ARN -> ~/.config/acv/lambda-arn ; resources -> ~/.config/acv/aws-resources.txt"
 echo "next: put ARN into alexa-skill/skill.json (both endpoint.uri) and deploy the skill via ASK CLI."

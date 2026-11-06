@@ -71,6 +71,13 @@ watch_and_reap() {
 
 pids=()
 names=()
+cleanup() {
+  for child in "${pids[@]}"; do kill -TERM "$child" 2>/dev/null || true; done
+  for child in "${pids[@]}"; do wait "$child" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for f in $BRIEFS; do
   [ -f "$f" ] || continue
@@ -84,6 +91,7 @@ for f in $BRIEFS; do
           -m grok-4.6 --reasoning-effort high --max-turns 40 \
           >"$OUT/$name.md" 2>"$OUT/$name.err" </dev/null &
         gp=$!
+        trap 'kill -KILL "$gp" 2>/dev/null || true; exit 143' TERM INT
         watch_and_reap "$gp" "$OUT/$name.md" "$name"
         echo "$?" >"$OUT/$name.rc"
       ) &

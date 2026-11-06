@@ -365,6 +365,9 @@ func (c *LiveClient) HangupRetry(ctx context.Context, sessionID string, attempts
 			return nil
 		}
 		last = err
+		if status, ok := httpStatus(err); ok && status == 404 {
+			return nil // already gone: there is no paid session left to close
+		}
 		// An invalid or revoked key will not become valid on retry; say so once and stop.
 		if status, ok := httpStatus(err); ok && status == 401 {
 			c.event("live_hangup_auth_failed", "id", sessionID,
