@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased] - 2026-11-05
 
+### Final verification round - 2026-11-06
+- Applied 126 of 299 fleet findings/leads and rejected 173 after checking the cited code; `APPLIED.tmp.md` records every disposition, including duplicates and speculative limitations.
+- Prevented paid-generation timeout retries, stale Echo dials/cleanup and late directive redelivery; hangup 404 now ends retries immediately. Idle, maximum-age, budget, ledger and farewell protections remain enabled; greeting remains off.
+- Fixed reflector shutdown, sideband Close/Reattach, scanner-producer lifetime, memory-save ordering, confirmation timer replacement, diagnostic callback publication and ICE-state collection; added offline race regressions and Linux race CI.
+- Hardened signaling replay/type checks, vault append confinement with `os.Root`, remote vault TLS, URL credentials/redirect handling, partial HTTP reads, Lambda lifecycle cleanup and scoped deployment permissions. Router/backend/reflection Responses requests disable stored responses.
+- Corrected live-spend initialization accounting, unknown-model cost reporting, prayer timezone, weather labels and diagnostic RTP statistics. Audio timing, framing, numbering, codec and pacing defaults are unchanged.
+- Hardened offline diagnostic port ownership, temporary audio privacy, billing sweep identity matching and corrupt-file/report handling; added offline Lambda and Python regression suites.
+- Refreshed Go modules; declared stable releases were already current. Pinned `golang.org/x/crypto` to verified newest upstream commit `v0.58.1-0.20261105095718-a1058eb15227` including the GO-2026-5932 fix. Verified existing Actions `v7` refs against latest checkout v7.0.1/setup-go v7.0.0 releases.
+- Offline Windows build, vet, uncached tests, portable-compiler race tests and govulncheck passed; Linux/amd64 cross-build and cross-vet also passed. Real Echo audio, deployed AWS/OpenAI behavior and remote Linux runtime were not exercised. Remote vault users now need HTTPS/certificates or a TLS proxy to loopback HTTP.
+
 ### Added
 - MIT `LICENSE` file.
 - GitHub Actions CI workflow (`.github/workflows/ci.yml`) running `go build ./...`, `go vet ./...`, `go test -count=1 ./...`, and `node --check lambda/index.mjs` on `ubuntu-latest` and `windows-latest`.

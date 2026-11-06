@@ -29,7 +29,7 @@ def main(log, sess):
             "t": e.get("since_answer_ms", 0) / 1000.0,
             "sent": out.get("pkts_sent", 0),
             "lost_total": out.get("remote_lost", 0),
-            "frac": out.get("remote_fraction_lost", 0.0),
+            "frac": out.get("remote_fraction_lost") or 0.0,
             "out_jit_ms": (out.get("remote_jitter") or 0) * 1000,
             "in_lost": inn.get("lost", 0),
             "in_jit_ms": (inn.get("jitter") or 0) * 1000,

@@ -10,7 +10,7 @@
 # so the recording of its voice comes back as encoded silence and proves nothing about quality.
 #
 # Usage: scripts/preflight.sh [seconds] [audio-file]
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 SECS="${1:-8}"
 SAY="${2:-media/hello.ogg}"
@@ -18,28 +18,31 @@ PORT=8798
 UDP=50012
 RUN="preflight-$(date -u +%H%M%S)"
 
-if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT "; then
-  echo "port $PORT is busy; refusing to run so this cannot hit the live bridge" >&2
-  exit 1
+source "$ROOT/scripts/lib/safe-port.sh"
+assert_not_live "$PORT"
+if port_busy "$PORT" || port_busy "$UDP" udp; then
+  echo "diagnostic TCP or UDP port is busy or unverified; refusing" >&2
+  exit 3
 fi
+TMP="$(mktemp -d)"
+CHILD=""
+trap 'stop_child "$CHILD"; rm -rf -- "$TMP"' EXIT
+
 
 ./bin/bridge --run "$RUN" --listen "127.0.0.1:$PORT" --udp-port "$UDP" \
   --video sendonly --video-fps 1 --hold-after-disconnect 2s --max-session 2m \
-  --delegation client --record-dir "/tmp/preflight-rec" >/tmp/preflight-bridge.log 2>&1 &
+  --delegation client --record-dir "$TMP/rec" >"$TMP/preflight-bridge.log" 2>&1 &
 BR=$!
-sleep 2
-if grep -q '"ev":"http_error"' /tmp/preflight-bridge.log; then
-  echo "bridge failed to listen:" >&2; grep '"ev":"http_error"' /tmp/preflight-bridge.log >&2
-  kill -INT $BR 2>/dev/null; exit 1
-fi
+CHILD=$BR
+wait_owned_tcp "$BR" "$PORT" || exit 3
 
-./bin/echosim --url "http://127.0.0.1:$PORT" --audio-file "$SAY" --duration "${SECS}s" 2>/tmp/preflight-echosim.err >/tmp/preflight-answer.json
-kill -INT $BR 2>/dev/null; wait $BR 2>/dev/null
+./bin/echosim --url "http://127.0.0.1:$PORT" --audio-file "$SAY" --duration "${SECS}s" 2>"$TMP/preflight-echosim.err" >"$TMP/preflight-answer.json"
+stop_child "$BR"; CHILD=""
 
 python3 - "runs/$RUN/events.jsonl" <<'PY'
 import json, sys
 
-evs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+evs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
 by = {}
 for e in evs:
     by.setdefault(e["ev"], []).append(e)

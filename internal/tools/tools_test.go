@@ -150,7 +150,7 @@ func TestSpendCountsTheCallInProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "1.9") && !strings.Contains(out, "1.88") {
+	if !strings.Contains(out, "1.88 riyals") || !strings.Contains(out, "0.50 dollars") {
 		t.Errorf("the running call is missing from the total: %s", out)
 	}
 	if !strings.Contains(out, "still running") {

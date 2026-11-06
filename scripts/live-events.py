@@ -52,6 +52,7 @@ def main():
                 path = p
                 f.close()
                 f = open(path, "r", encoding="utf-8")
+                t0 = None
                 print("following " + path, flush=True)
                 continue
             time.sleep(0.25)

@@ -54,8 +54,9 @@ function hmacHeaders(rawBody) {
 }
 
 async function callUbuntu(path, obj, timeoutMs = 8000) {
-  if (!UBUNTU_URL || !SIGNING_KEY) {
-    throw new Error("ACV_UBUNTU_URL / ACV_SIGNING_KEY not configured");
+  const target = new URL(UBUNTU_URL);
+  if (target.protocol !== "https:" || target.username || target.password || !SIGNING_KEY) {
+    throw new Error("gateway requires HTTPS without embedded credentials and a signing key");
   }
   const raw = JSON.stringify(obj);
   const ctrl = new AbortController();
@@ -66,6 +67,7 @@ async function callUbuntu(path, obj, timeoutMs = 8000) {
       headers: hmacHeaders(raw),
       body: raw,
       signal: ctrl.signal,
+      redirect: "error",
     });
     const text = await res.text();
     let json;
@@ -74,6 +76,22 @@ async function callUbuntu(path, obj, timeoutMs = 8000) {
   } finally {
     clearTimeout(t);
   }
+}
+
+async function lifecycle(type, sessionId, timeoutMs = 2000) {
+  const attempts = type === "disconnected" ? 2 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const { status } = await callUbuntu("/rtc/" + type, {
+        v: 1, type, sessionId, ts: Date.now() / 1000, nonce: uuid(),
+      }, timeoutMs);
+      console.log(JSON.stringify({ ev: "gateway_lifecycle", type, status, attempt }));
+      if (status >= 200 && status < 300) return true;
+    } catch (e) {
+      console.log(JSON.stringify({ ev: "gateway_lifecycle_failed", type, err: e?.name || "Error", attempt }));
+    }
+  }
+  return false;
 }
 
 // ---------- response builders ----------
@@ -250,24 +268,19 @@ export const handler = async (event) => {
         if (status === 200 && json?.type === "answer" && json.sdp) {
           return answerEvent(correlationToken, endpointId, scope, json.sdp);
         }
+        await lifecycle("disconnected", sessionId, 350);
         return errorResponse(
           correlationToken, endpointId, "INTERNAL_ERROR",
           "gateway did not return an answer (status " + status + ")");
       }
 
       if (name === "SessionConnected") {
-        await callUbuntu("/rtc/connected", {
-          v: 1, type: "connected", sessionId,
-          ts: Date.now() / 1000, nonce: uuid(),
-        }).catch(() => {});
+        await lifecycle("connected", sessionId);
         return sessionAck("SessionConnected", correlationToken, endpointId, scope, sessionId);
       }
 
       if (name === "SessionDisconnected") {
-        await callUbuntu("/rtc/disconnected", {
-          v: 1, type: "disconnected", sessionId,
-          ts: Date.now() / 1000, nonce: uuid(),
-        }).catch(() => {});
+        await lifecycle("disconnected", sessionId);
         return sessionAck("SessionDisconnected", correlationToken, endpointId, scope, sessionId);
       }
     }
@@ -275,6 +288,9 @@ export const handler = async (event) => {
     return errorResponse(correlationToken, endpointId, "INVALID_DIRECTIVE",
       "unhandled " + ns + "/" + name);
   } catch (e) {
+    if (ns === "Alexa.RTCSessionController" && name === "InitiateSessionWithOffer") {
+      await lifecycle("disconnected", directive.payload?.sessionId, 350);
+    }
     // never leak secrets — log the error identity plus the CAUSE CHAIN. Node's fetch reports
     // every network problem as the same opaque "fetch failed"; the reason (ENOTFOUND,
     // ECONNREFUSED, ECONNRESET, UND_ERR_CONNECT_TIMEOUT, a TLS error) is only in e.cause.

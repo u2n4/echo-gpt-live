@@ -75,14 +75,19 @@ func Spend(path string, ratePerMinuteUSD, limitUSD float64, running func() time.
 					spentSoFar(liveUSD, live) + " The last record before that is from " + f.Day + ".", nil
 			}
 
-			usd := f.Seconds/60*ratePerMinuteUSD + liveUSD
+			// The budget already charged this call's first 15 seconds at creation.
+			extra := live.Seconds() - 15
+			if extra < 0 {
+				extra = 0
+			}
+			usd := (f.Seconds + extra) / 60 * ratePerMinuteUSD
 			sar := usd * SARPerUSD
-			minutes := f.Seconds/60 + live.Minutes()
+			minutes := (f.Seconds + extra) / 60
 
 			if limitUSD <= 0 {
 				return fmt.Sprintf(
-					"Today: %.2f riyals, about %.2f dollars, over %d calls and %.0f minutes of talking. No daily limit is set.",
-					sar, usd, f.Sessions, minutes), nil
+					"Today: %.2f riyals, about %.2f dollars, over %d calls and %.0f minutes of talking%s. No daily limit is set.",
+					sar, usd, f.Sessions, minutes, thisCall(live)), nil
 			}
 			leftUSD := limitUSD - usd
 			if leftUSD < 0 {

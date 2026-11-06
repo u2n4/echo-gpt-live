@@ -239,7 +239,7 @@ func (f *Farewell) Feed(text string) bool {
 	// New speech withdraws a goodbye that has not yet taken effect, but only real speech. A
 	// transcriber emits trailing fragments of its own, and a stray character or a piece of
 	// punctuation arriving after "goodbye" must not hold the line open until the idle timer.
-	if f.armed && substantive(text) {
+	if f.armed && substantive(f.recent) {
 		// The asymmetry here is deliberate. While she is speaking, a "new utterance" is far more
 		// likely to be her own voice echoing off the room than him changing his mind, so it must
 		// not KEEP the call alive - that is the direction that costs money and that he noticed.

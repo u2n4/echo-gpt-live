@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -73,8 +74,8 @@ func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error)
 	if c.APIKey == "" {
 		return nil, ErrNoAPIKey
 	}
-	url := callsURL + "?model=" + c.Model
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(offerSDP))
+	endpoint := callsURL + "?model=" + url.QueryEscape(c.Model)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(offerSDP))
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +173,7 @@ func (s *Sideband) Read(ctx context.Context) error {
 		case strings.Contains(t, "transcript") || strings.Contains(t, "text") || strings.Contains(t, "delta"):
 			s.c.event("openai_event", "type", t, "chars", len(data))
 		default:
-			s.c.event("openai_event", "type", t, "raw", truncate(string(data), 500))
+			s.c.event("openai_event", "type", t, "bytes", len(data))
 		}
 	}
 }

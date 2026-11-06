@@ -84,6 +84,9 @@ func TestPacerSpreadsABurstBackToTwentyMilliseconds(t *testing.T) {
 		p.Write(pkt(uint16(i), uint32(i)*960))
 	}
 	at := waitFor(c, 10, 3*time.Second)
+	if len(at) != 10 {
+		t.Fatalf("only %d of 10 timed packets came out", len(at))
+	}
 
 	seq, _ := c.snapshot()
 	if len(seq) != 10 {

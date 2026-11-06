@@ -73,7 +73,7 @@ func (d *durMeter) flush(now time.Time) {
 	d.ev("write_"+d.label,
 		"n", n,
 		"median_ms", ms(s[n/2]),
-		"p95_ms", ms(s[(n*95)/100]),
+		"p95_ms", ms(s[(n*95+99)/100-1]),
 		"max_ms", ms(s[n-1]),
 		"slow_frac", float64(d.slowN)/float64(n),
 		"note", "a forward slower than 5 ms delays the next read and shows up as a burst that is not one")

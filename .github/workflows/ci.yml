@@ -26,5 +26,10 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -count=1 ./...
+      - name: Race tests
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
       - name: Check Lambda syntax
         run: node --check lambda/index.mjs
+      - name: Offline Lambda regressions
+        run: node --test lambda/index.test.mjs

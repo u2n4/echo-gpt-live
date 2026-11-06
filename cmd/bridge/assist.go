@@ -207,8 +207,9 @@ type assistant struct {
 	hangUp func(at time.Time) bool
 
 	// confirmMu guards confirmTimer only; the permission itself lives in pendingWrite.
-	confirmMu    sync.Mutex
-	confirmTimer *time.Timer
+	confirmMu         sync.Mutex
+	confirmTimer      *time.Timer
+	confirmGeneration uint64
 }
 
 // confirmQuiet is how long a heard yes waits for the rest of its utterance. The transcript
@@ -355,6 +356,7 @@ func (a *assistant) act(ctx context.Context, call string, said heard) {
 func (a *assistant) stopConfirm() {
 	a.confirmMu.Lock()
 	defer a.confirmMu.Unlock()
+	a.confirmGeneration++
 	if a.confirmTimer != nil {
 		a.confirmTimer.Stop()
 		a.confirmTimer = nil
@@ -371,17 +373,27 @@ func (a *assistant) deferConfirm(ctx context.Context, call string, at time.Time)
 	if a.confirmTimer != nil {
 		a.confirmTimer.Stop()
 	}
+	a.confirmGeneration++
+	generation := a.confirmGeneration
 	a.confirmTimer = time.AfterFunc(confirmQuiet, func() {
-		a.confirmMu.Lock()
-		a.confirmTimer = nil
-		a.confirmMu.Unlock()
-		if ctx.Err() != nil {
-			return // the call ended inside the window
-		}
-		if said := listen(a.window.since(at)); said != heardNothing {
-			a.act(ctx, call, said)
-		}
+		a.finishConfirm(generation, ctx, call, at)
 	})
+}
+
+func (a *assistant) finishConfirm(generation uint64, ctx context.Context, call string, at time.Time) {
+	a.confirmMu.Lock()
+	if generation != a.confirmGeneration {
+		a.confirmMu.Unlock()
+		return
+	}
+	a.confirmTimer = nil
+	a.confirmMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	if said := listen(a.window.since(at)); said != heardNothing {
+		a.act(ctx, call, said)
+	}
 }
 
 // settle runs, or declines to run, the one write he was asked about, and says what happened.
@@ -395,7 +407,7 @@ func (a *assistant) settle(ctx context.Context, sp speaker, deleg, tool, args st
 	out, err := a.answerer.RunTool(ctx, tool, args)
 	if err != nil {
 		a.ev("delegation_write_failed", "tool", tool, "err", err.Error())
-		out = spokenFailed + err.Error()
+		out = spokenFailed
 	} else if tool == "remember" {
 		// What she knows about him changed a second ago; the next question should know it too.
 		if refresh := a.refresher(); refresh != nil {
@@ -489,6 +501,9 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 	ask.PrevQ, ask.PrevA = a.previous()
 
 	answer, err := a.answerer.Answer(ctx, ask)
+	if ctx.Err() != nil {
+		return // an ended call cannot arm permission or a goodbye in its successor
+	}
 	if err != nil {
 		var ending *tools.ErrCallEnding
 		if errors.As(err, &ending) {

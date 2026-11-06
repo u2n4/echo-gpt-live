@@ -88,9 +88,9 @@ func TestHoldSinkWriterCannotOvertakeTheFlush(t *testing.T) {
 	if len(got) != 400 {
 		t.Fatalf("forwarded %d packets, want 400", len(got))
 	}
-	for i := 1; i < len(got); i++ {
-		if got[i] < got[i-1] {
-			t.Fatalf("packet %d came after %d", got[i], got[i-1])
+	for i := 0; i < len(got); i++ {
+		if got[i] != uint16(i+1) {
+			t.Fatalf("packet %d was %d, want %d", i, got[i], i+1)
 		}
 	}
 }

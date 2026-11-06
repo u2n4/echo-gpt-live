@@ -11,11 +11,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 REC="$HOME/.local/state/rtcdiag/rec"
 LOG="$HOME/.local/state/rtcdiag/bridge.log"
 
-if [ $# -ge 1 ]; then
-  DIR="$(find "$REC" -maxdepth 1 -type d -name "$1*" | head -1)"
-else
-  DIR="$(ls -dt "$REC"/*/ 2>/dev/null | head -1)"
-fi
+TMP="$(mktemp -d)"
+trap 'rm -rf -- "$TMP"' EXIT
+DIR=""
+for d in "$REC"/*/; do
+  [ -d "$d" ] || continue
+  base="$(basename "$d")"
+  [ $# -lt 1 ] || [[ "$base" == "$1"* ]] || continue
+  if [ -z "$DIR" ] || [ "$d" -nt "$DIR" ]; then DIR="$d"; fi
+done
 [ -n "${DIR:-}" ] && [ -d "$DIR" ] || { echo "no recording found under $REC" >&2; exit 1; }
 SESS="$(basename "$DIR" | cut -c1-8)"
 echo "################ call $SESS ################"
@@ -30,8 +34,8 @@ for f in from-openai from-echo; do
   esac
   echo "======== $what ========"
   python3 scripts/oggdump.py "$DIR/$f.ogg" 0 | tail -3
-  ffmpeg -v error -i "$DIR/$f.ogg" -ar 48000 -ac 1 "/tmp/$SESS-$f.wav" -y
-  python3 scripts/audio-report.py "/tmp/$SESS-$f.wav"
+  ffmpeg -v error -i "$DIR/$f.ogg" -ar 48000 -ac 1 "$TMP/$f.wav" -y || { echo "decode failed: $f" >&2; exit 1; }
+  python3 scripts/audio-report.py "$TMP/$f.wav"
   echo
 done
 

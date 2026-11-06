@@ -31,8 +31,10 @@ func wmo(code int) string {
 	switch {
 	case code == 0:
 		return "clear"
-	case code <= 3:
+	case code <= 2:
 		return "partly cloudy"
+	case code == 3:
+		return "overcast"
 	case code == 45 || code == 48:
 		return "foggy"
 	case code >= 51 && code <= 57:

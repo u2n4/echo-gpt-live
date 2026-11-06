@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -406,11 +407,12 @@ func (c *LiveClient) recordOpened(sessionID string) error {
 // the official Python SDK's generated API listing as
 // wss://api.openai.com/v1/live/sessions/{session_id}/attach.
 type LiveSideband struct {
-	conn *websocket.Conn
-	c    *LiveClient
-	id   string
-	seq  int
-	mu   sync.Mutex
+	conn   *websocket.Conn
+	c      *LiveClient
+	id     string
+	seq    int
+	mu     sync.Mutex
+	closed bool // protected by mu; an in-flight dial cannot resurrect a closed sideband
 	// lastEvent is when the socket last delivered anything. While audio is flowing to the
 	// session OpenAI announces every chunk of it here, several times a second, so a socket that
 	// says nothing for ten seconds has died the way a TCP connection dies over WiFi: silently,
@@ -458,11 +460,22 @@ func (c *LiveClient) dialSideband(ctx context.Context, sessionID string) (*webso
 // because the transcript is what the idle timer listens to, the bridge hung up on him at 119 s
 // while he was talking.
 func (s *LiveSideband) Reattach(ctx context.Context) error {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return net.ErrClosed
+	}
 	conn, err := s.c.dialSideband(ctx, s.id)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.CloseNow()
+		return net.ErrClosed
+	}
 	old := s.conn
 	s.conn = conn
 	s.attached.Add(1)
@@ -564,7 +577,13 @@ func (s *LiveSideband) Read(ctx context.Context, onEvent func(typ string, raw []
 }
 
 // Close shuts the sideband socket.
-func (s *LiveSideband) Close() error { return s.current().Close(websocket.StatusNormalClosure, "bye") }
+func (s *LiveSideband) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	conn := s.conn
+	s.mu.Unlock()
+	return conn.Close(websocket.StatusNormalClosure, "bye")
+}
 
 // Hangup ends the session server-side and stops the per-minute clock.
 func (c *LiveClient) Hangup(ctx context.Context, sessionID string) error {

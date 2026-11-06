@@ -256,6 +256,13 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string, confir
 	case <-done:
 		return out, err
 	case <-ctx.Done():
+		// A completed write must not be reported as failed just because its deadline
+		// became ready in the same select. done also publishes out and err safely.
+		select {
+		case <-done:
+			return out, err
+		default:
+		}
 		return "", fmt.Errorf("%w: %s", ErrToolTimeout, name)
 	}
 }
