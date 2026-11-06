@@ -43,6 +43,24 @@ func TestLiveSequenceWrapUnchanged(t *testing.T) {
 	}
 }
 
+func TestLiveSequence64PacketLossKeepsTimeline(t *testing.T) {
+	var tr liveSequenceTranslator
+	for _, p := range []*rtp.Packet{
+		packet(100, 1000, []byte{0xd8}),
+		packet(101, 1960, []byte{0xd8}),
+		packet(166, 64360, []byte{0xd8}), // 64 lost 20 ms packets: preserve 1,280 ms.
+		packet(167, 65320, []byte{0xd8}),
+	} {
+		seq, ts := p.SequenceNumber, p.Timestamp
+		if _, rebased := tr.translate(p); rebased || p.SequenceNumber != seq || p.Timestamp != ts {
+			t.Fatalf("(%d,%d) became (%d,%d), rebased=%v", seq, ts, p.SequenceNumber, p.Timestamp, rebased)
+		}
+		if tr.rebased || tr.seqOffset != 0 || tr.tsOffset != 0 || tr.Missed() != 0 {
+			t.Fatalf("loss changed translator state: %+v", tr)
+		}
+	}
+}
+
 func TestOpusPacketDurations(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

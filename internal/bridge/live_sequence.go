@@ -69,6 +69,11 @@ func (t *liveSequenceTranslator) translate(pkt *rtp.Packet) (liveSequenceRebase,
 		// the sequence intact is a burst of loss, not a restart (a restart goes back towards
 		// zero, and a 21-packet loss inside the window used to be spliced as one). Muse found it.
 		tsJump := t.prevOK && tsDelta < -int64(timestampReorderTolerance)
+		// Matching sequence and media gaps are packet loss, including inside the
+		// probe window. Preserve the sender's timeline and leave offsets unset.
+		if t.prevOK && seqDelta > 1 && tsDelta == int64(seqDelta-1)*int64(t.prevDur) {
+			seqJump, tsJump = false, false
+		}
 		switch {
 		case (seqJump || tsJump) && t.seen <= rebaseWindowPackets:
 			oldSeq, oldTS := pkt.SequenceNumber, pkt.Timestamp
