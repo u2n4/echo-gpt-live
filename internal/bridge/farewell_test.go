@@ -244,12 +244,33 @@ func TestFarewellRealGoodbyes(t *testing.T) {
 		"اوكي مع السلامه",
 		"مع السلامة.",
 		"مَعَ السَّلَامَة",
+		"مع السلامة أسترا",
+		"مع السلامة يا أسترا",
+		"مع السلامة يعطيك العافية",
+		"مع السلامة شكراً",
+		"باي باي",
+		"باي أسترا",
+		"قفلي المكالمة",
+		"سكري الخط",
+		"الله يحفظك",
 	}
 	for _, s := range says {
 		f := NewFarewell(nil, nil)
 		if !f.Feed(s) {
 			t.Errorf("did not hear a goodbye in %q", s)
 		}
+	}
+}
+
+func TestFarewellPoliteTailFragmentDoesNotWithdraw(t *testing.T) {
+	f := NewFarewell(nil, nil)
+	if !f.Feed("مع السلامة") {
+		t.Fatal("should have armed")
+	}
+	f.Feed(" يا أسترا")
+	f.Feed(" يعطيك العافية")
+	if !f.IsArmed() {
+		t.Fatal("polite tail after goodbye must not withdraw it")
 	}
 }
 

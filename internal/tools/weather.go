@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -31,10 +32,8 @@ func wmo(code int) string {
 	switch {
 	case code == 0:
 		return "clear"
-	case code <= 2:
+	case code <= 3:
 		return "partly cloudy"
-	case code == 3:
-		return "overcast"
 	case code == 45 || code == 48:
 		return "foggy"
 	case code >= 51 && code <= 57:
@@ -57,16 +56,17 @@ func Weather(lat, lon float64, tz string, client *http.Client) *Tool {
 	}
 	return &Tool{
 		Name: "weather_now",
-		Description: "The weather right now where he lives: temperature, what it feels like, " +
-			"humidity and wind. Answers 'كم درجة الحرارة', 'كيف الجو', 'الجو حار اليوم', " +
-			"'how hot is it', 'what is the weather'. Use this instead of searching the web; it is " +
-			"the reading itself, and it is far faster.",
+		Description: "Current weather, yesterday's weather/rain, and the 7-day daily forecast where he lives " +
+			"(temperature, feels-like, humidity, wind, daily highs/lows, rain probability). " +
+			"Answers 'كم درجة الحرارة', 'كيف الجو', 'كان فيه مطر', 'الأسبوع الجاي', 'أبرد يوم', " +
+			"'weather', 'forecast', 'rain'. Always use this instead of searching the web.",
 		Access:  Read,
 		Ambient: true,
 		Timeout: 6 * time.Second,
 		Run: func(ctx context.Context, _ map[string]any) (string, error) {
 			u := fmt.Sprintf("%s?latitude=%.4f&longitude=%.4f&timezone=%s"+
-				"&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,weather_code",
+				"&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,weather_code"+
+				"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,weather_code&forecast_days=7&past_days=1",
 				weatherBase, lat, lon, url.QueryEscape(tz))
 			body, err := get(ctx, client, u, 64<<10, nil)
 			if err != nil {
@@ -81,6 +81,14 @@ func Weather(lat, lon float64, tz string, client *http.Client) *Tool {
 					Wind     float64 `json:"wind_speed_10m"`
 					Code     int     `json:"weather_code"`
 				} `json:"current"`
+				Daily struct {
+					Time     []string  `json:"time"`
+					Max      []float64 `json:"temperature_2m_max"`
+					Min      []float64 `json:"temperature_2m_min"`
+					RainProb []float64 `json:"precipitation_probability_max"`
+					RainMM   []float64 `json:"precipitation_sum"`
+					Code     []int     `json:"weather_code"`
+				} `json:"daily"`
 			}
 			if json.Unmarshal(body, &r) != nil || r.Current.Time == "" {
 				return "", fmt.Errorf("the weather service sent something unreadable")
@@ -90,15 +98,42 @@ func Weather(lat, lon float64, tz string, client *http.Client) *Tool {
 			// The feels-like figure is the one that matters on this coast: 34 degrees at 69 percent
 			// humidity is 42 to a person standing in it. Say it only when it differs enough to be
 			// worth a second number.
-			s := fmt.Sprintf("%.0f degrees", c.Temp)
+			s := fmt.Sprintf("Now: %.0f degrees", c.Temp)
 			if diff := c.Feels - c.Temp; diff >= 2 || diff <= -2 {
 				s += fmt.Sprintf(", feels like %.0f", c.Feels)
 			}
 			if w := wmo(c.Code); w != "" {
 				s += ", " + w
 			}
-			s += fmt.Sprintf(", humidity %.0f percent, wind %.0f kilometres an hour", c.Humidity, c.Wind)
-			return s + ".", nil
+			s += fmt.Sprintf(", humidity %.0f percent, wind %.0f km/h.", c.Humidity, c.Wind)
+
+			// Append compact yesterday + 7-day forecast so follow-up questions about recent rain
+			// or next week's temperatures answer in one round without web search.
+			if n := len(r.Daily.Time); n > 0 {
+				var parts []string
+				for i := 0; i < n && i < len(r.Daily.Max) && i < len(r.Daily.Min); i++ {
+					dayLabel := r.Daily.Time[i]
+					if dt, perr := time.Parse("2006-01-02", dayLabel); perr == nil {
+						dayLabel = dt.Format("Mon 2 Jan")
+					}
+					entry := fmt.Sprintf("%s %.0f/%.0fC", dayLabel, r.Daily.Min[i], r.Daily.Max[i])
+					if i < len(r.Daily.Code) {
+						if w := wmo(r.Daily.Code[i]); w != "" && w != "clear" {
+							entry += " " + w
+						}
+					}
+					if i < len(r.Daily.RainMM) && r.Daily.RainMM[i] >= 0.2 {
+						entry += fmt.Sprintf(" (%.1fmm rain)", r.Daily.RainMM[i])
+					} else if i < len(r.Daily.RainProb) && r.Daily.RainProb[i] >= 25 {
+						entry += fmt.Sprintf(" (%.0f%% rain)", r.Daily.RainProb[i])
+					}
+					parts = append(parts, entry)
+				}
+				if len(parts) > 0 {
+					s += " Daily (yesterday + 7d): " + strings.Join(parts, "; ") + "."
+				}
+			}
+			return s, nil
 		},
 	}
 }

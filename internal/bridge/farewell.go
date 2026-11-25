@@ -40,13 +40,27 @@ var DefaultFarewells = []string{
 	"الى اللقاء",
 	"تصبح على خير",
 	"تصبحين على خير",
+	"تصبحون على خير",
 	"في امان الله",
+	"الله يحفظك",
 	"يلا باي",
 	"خلاص باي",
+	"باي باي",
+	"باي استرا",
 	"خلاص مع السلامه",
 	// Arabic, an explicit instruction
 	"اقفل المكالمه",
+	"اقفلي المكالمه",
+	"قفل المكالمه",
+	"قفلي المكالمه",
 	"سكر المكالمه",
+	"سكري المكالمه",
+	"اقفل الخط",
+	"اقفلي الخط",
+	"قفل الخط",
+	"قفلي الخط",
+	"سكر الخط",
+	"سكري الخط",
 	"اقفل الاتصال",
 	"انهي المكالمه",
 	// English, leaving
@@ -60,6 +74,50 @@ var DefaultFarewells = []string{
 	"end the call",
 	"hang up",
 	"stop the call",
+}
+
+// farewellTails are polite or addressing words that often trail a goodbye ("مع السلامة يا أسترا",
+// "مع السلامة يعطيك العافية", "مع السلامة شكراً"). Stripping them lets the suffix match succeed
+// AND prevents a trailing fragment like "أسترا" from withdrawing a goodbye that just armed.
+var farewellTails = []string{
+	"يعطيك العافيه",
+	"الله يعافيك",
+	"يا استرا",
+	"استرا",
+	"astra",
+	"شكرا",
+	"يسلمو",
+	"مشكور",
+	"مشكوره",
+	"يلا",
+	"خلاص",
+	"طيب",
+	"تمام",
+}
+
+func stripFarewellTails(s string) string {
+	s = strings.TrimSpace(s)
+	for changed := true; changed; {
+		changed = false
+		for _, tail := range farewellTails {
+			if s == tail {
+				return ""
+			}
+			if strings.HasSuffix(s, " "+tail) {
+				s = strings.TrimSpace(strings.TrimSuffix(s, " "+tail))
+				changed = true
+			}
+		}
+	}
+	return s
+}
+
+func isFarewellTailOnly(text string) bool {
+	n := normalise(text)
+	if n == "" {
+		return true
+	}
+	return stripFarewellTails(n) == ""
 }
 
 // normalise folds the spelling variants that would otherwise make a match miss: Arabic diacritics,
@@ -239,7 +297,7 @@ func (f *Farewell) Feed(text string) bool {
 	// New speech withdraws a goodbye that has not yet taken effect, but only real speech. A
 	// transcriber emits trailing fragments of its own, and a stray character or a piece of
 	// punctuation arriving after "goodbye" must not hold the line open until the idle timer.
-	if f.armed && substantive(f.recent) {
+	if f.armed && substantive(f.recent) && !isFarewellTailOnly(f.recent) {
 		// The asymmetry here is deliberate. While she is speaking, a "new utterance" is far more
 		// likely to be her own voice echoing off the room than him changing his mind, so it must
 		// not KEEP the call alive - that is the direction that costs money and that he noticed.
@@ -254,8 +312,10 @@ func (f *Farewell) Feed(text string) bool {
 				"note", "the user kept talking, so the call stays open")
 		}
 	}
+	candidate := stripFarewellTails(f.recent)
 	for _, p := range f.phrases {
-		if strings.HasSuffix(f.recent, p) && !negated(f.recent, p) {
+		if (strings.HasSuffix(f.recent, p) && !negated(f.recent, p)) ||
+			(candidate != "" && strings.HasSuffix(candidate, p) && !negated(candidate, p)) {
 			f.armed, f.armedAt, f.matched = true, time.Now(), p
 			f.recent, f.raw = "", ""
 			f.ev("farewell_heard", "phrase", p, "note", "closing unless the user speaks again")

@@ -257,8 +257,8 @@ func (w *Web) Speculative(ctx context.Context, said string) string {
 // share a word ("how much" is both a price and a bill), because their answers are local and their
 // words should not leave the house.
 var (
-	worldRE = regexp.MustCompile(`(?i)سعر|اسعار|أسعار|بكم|كم يسوى|يسوى|كم تكلف|تكلفة|اخبار|أخبار|خبر|نتيجه|نتيجة|نتائج|مباراه|مباراة|فاز|احدث|أحدث|اخر اصدار|آخر اصدار|صدر|وش صار|ابحث|دور لي|شوف لي|الذهب|الدولار|سهم|اسهم|بيتكوين|بورصة|تطبيق|برنامج|اداة|أداة|موقع|لعبة|لعبه|` +
-		`price|cost|how much (is|does|do|are)|news|score|who won|latest|newest|release|search|look up|stock|bitcoin|gold|dollar|exchange rate|what happened|\bapp\b|software|program|website`)
+	worldRE = regexp.MustCompile(`(?i)سعر|اسعار|أسعار|بكم|كم يسوى|يسوى|كم تكلف|تكلفة|اخبار|أخبار|خبر|نتيجه|نتيجة|نتائج|مباراه|مباراة|فاز|احدث|أحدث|اخر اصدار|آخر اصدار|صدر|وش صار|ابحث|دور لي|شوف لي|الذهب|الدولار|سهم|اسهم|بيتكوين|بورصة|تطبيق|برنامج|اداة|أداة|موقع|لعبة|لعبه|اشهر|أشهر|مشهور|مشهورة|مشهوره|شركة|شركه|شركات|ماركة|ماركه|منتج|مناديل|افضل|أفضل|احسن|أحسن|مواصفات|` +
+		`price|cost|how much (is|does|do|are)|news|score|who won|latest|newest|release|search|look up|stock|bitcoin|gold|dollar|exchange rate|what happened|\bapp\b|software|program|website|best|popular|brand|company`)
 	localRE = regexp.MustCompile(`(?i)صرفت|صرف|ميزانيه|ميزانية|الجهاز|السيرفر|الذاكره|الذاكرة|تذكر|ملاحظات|البيت|الشبكه|الشبكة|` +
 		`spent|spend|budget|machine|server|memory|remember|notes|vault|house|network`)
 )

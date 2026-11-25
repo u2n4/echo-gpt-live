@@ -158,7 +158,8 @@ const answerSystem = `You are the smart backend behind a voice-only smart speake
 Rules:
 - One to three crisp, natural spoken sentences. Never a list, never a table, never markdown, never URLs.
 - VOICE-ONLY SPEAKER: The user CANNOT type, CANNOT send images/screenshots, and CANNOT paste links. NEVER say "send a photo", "type it in English", "write the spelling", or "where did you see it?". NEVER add robotic filler like "if you have another question I can help".
-- The user's words come from voice transcription (often Arabic ASR), so English app, software, tool, brand, game, and product names are frequently transliterated or slightly misheard (e.g. "تي ثري كوت" / "تي ثري كورد" -> "T3 Code", "أمددتون" / "أمازون" -> check context, "كرسر" -> "Cursor"). Always infer the closest real English/tech name from the sounds and context ("برنامج", "تطبيق", "موقع", "أداة", "لعبة").
+- The user's words come from voice transcription (often Arabic ASR), so English app, software, tool, brand, game, and product names are frequently transliterated or slightly misheard (e.g. "تي ثري كوت" / "تي ثري كورد" -> "T3 Code", "مطر" misheard as "مطار", "مناديل" misheard as "نشافات"). Always infer the closest real word from context.
+- CORRECTIONS OVERRIDE PREVIOUS CONTEXT: If the user corrects a misheard word (e.g. says "مطر مو مطار", repeats a corrected word, says "لا أقصد ...", or translates it to English like "rain"), IMMEDIATELY discard the wrong previous topic from earlier in the call. NEVER keep arguing about or searching for the misheard old word.
 - NEVER ask useless or interrogative clarifying questions ("where did you see it?", "on your phone or car?", "which device?", "what do you mean?"). Just do the work: search immediately, pick the single most likely real-world match, and give a helpful, direct answer.
 - Whenever he asks about ANY app, program, software, tool, website, product, brand, model, game, person, price, score, news, recent event, or ANY name you are not 100% certain about — ALWAYS use web_search immediately with the inferred English name (plus a context word like "app" or "software" if helpful). Never say you cannot identify it from the name alone before searching.
 - Use local tools when the answer depends on this machine, this house, his notes, weather, or prayer times. For pure timeless general knowledge you are 100% sure of, answer directly without tools.
@@ -490,28 +491,38 @@ func (a *Answerer) Answer(ctx context.Context, q Question) (string, error) {
 	return "", fmt.Errorf("gave up after %d rounds of tools", answerRounds)
 }
 
-// roundWait bounds one model round. A timeout does not prove that the server stopped
-// generating, so replaying a timed-out request could bill the same question twice.
+// roundWait is how long one model round may take before it is abandoned and asked again. The
+// rounds measured on 16 September 2026 were 1.1-2.7 s; one request of thirty then sat for the
+// whole 25 s deadline and answered nothing. A stalled request is not a slow one, and the second
+// attempt is what a person would do.
 const (
 	roundWait       = 9 * time.Second
 	searchRoundWait = 18 * time.Second
 )
 
-// postRound posts exactly once, with a per-round deadline.
+// postRound posts one round with its own patience, and tries once more on a stall while the
+// deadline allows it.
 func (a *Answerer) postRound(ctx context.Context, body map[string]any) (*respBody, error) {
 	wait := roundWait
 	if a.WebSearch {
+		// Server-side OpenAI web_search fetches pages inside one Responses call.
 		wait = searchRoundWait
 	}
-	rctx, cancel := context.WithTimeout(ctx, wait)
-	defer cancel()
-	return a.post(rctx, body)
+	for attempt := 1; ; attempt++ {
+		rctx, cancel := context.WithTimeout(ctx, wait)
+		out, err := a.post(rctx, body)
+		cancel()
+		if err == nil || ctx.Err() != nil || attempt == 2 {
+			return out, err
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return out, err
+		}
+		a.event("answer_round_stalled", "after_s", wait.Seconds(), "note", "asking again")
+	}
 }
 
 func (a *Answerer) post(ctx context.Context, body map[string]any) (*respBody, error) {
-	// Router and reflection continuations carry their own history; neither needs
-	// a retrievable server-side copy of the user's speech or profile.
-	body["store"] = false
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err

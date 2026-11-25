@@ -57,6 +57,8 @@ type app struct {
 	paceFor    time.Duration
 	markSpurts bool
 	pacer      *bridge.Pacer
+	micBoost   *bridge.MicBooster // optional far-field Opus AGC on Echo -> OpenAI
+	micAGCdB   float64
 	recIn      *bridge.Recorder // what the Echo's microphone sent
 	recOut     *bridge.Recorder // what we asked the Echo to play
 	budget     *openai.Budget
@@ -476,8 +478,18 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 		a.mu.Unlock()
 	}
 
-	// Echo -> OpenAI. Opus payloads pass through; Pion rewrites SSRC and payload type only.
+	var micBoost *bridge.MicBooster
+	if a.micAGCdB > 0 {
+		var berr error
+		micBoost, berr = bridge.NewMicBooster(a.micAGCdB)
+		if berr != nil {
+			a.ev("mic_agc_unavailable", "err", berr.Error())
+		} else if micBoost != nil {
+			a.ev("mic_agc_enabled", "max_boost_db", a.micAGCdB)
+		}
+	}
 	a.mu.Lock()
+	a.micBoost = micBoost
 	recIn, recOut := a.recIn, a.recOut
 	a.mu.Unlock()
 
@@ -486,7 +498,10 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	toOpenAI := bridge.NewWriteMeter(a.ev, "to_openai")
 	forward := func(p *rtp.Packet) {
 		touchIfNoTranscript()
-		recIn.Write(p) // nil-safe
+		recIn.Write(p) // nil-safe (keeps raw Echo audio for diagnostics)
+		if micBoost != nil {
+			p = micBoost.ProcessRTP(p)
+		}
 		t0 := time.Now()
 		err := leg.WriteAudio(p)
 		toOpenAI.Observe(time.Since(t0))
@@ -579,8 +594,8 @@ func (a *app) closeLegFor(owner *bridge.Session, reason string) {
 		gate.Stop()
 	}
 	a.mu.Lock()
-	recIn, recOut, pacer := a.recIn, a.recOut, a.pacer
-	a.recIn, a.recOut, a.pacer = nil, nil, nil
+	recIn, recOut, pacer, micBoost := a.recIn, a.recOut, a.pacer, a.micBoost
+	a.recIn, a.recOut, a.pacer, a.micBoost = nil, nil, nil, nil
 	a.mu.Unlock()
 	// Order matters, and it used to be wrong. The hangup is what stops the clock, so it goes FIRST,
 	// ahead of every diagnostic. Flushing the pacer and the recorders first meant a slow disk could
@@ -610,6 +625,7 @@ func (a *app) closeLegFor(owner *bridge.Session, reason string) {
 	}
 	// Now the diagnostics, which nobody is paying for by the minute.
 	pacer.Close()
+	micBoost.Close()
 	recIn.Close()
 	recOut.Close()
 	bridge.FlushWriteMeters()
@@ -943,13 +959,14 @@ func main() {
 		// 20:52 call of 2026-09-13 did both, and the one-word start is so he knows she can hear
 		// without a greeting long enough to talk over him.
 		instr = flag.String("instructions", "انت \"أسترا\"، مساعد صوتي ذكي في البيت عبر سماعة صوتية فقط (بدون شاشة ولا كيبورد ولا كاميرا). أسلوبك طبيعي وذكي وواضح زي شات جي بي تي الصوتي، هادي ومختصر بدون مبالغة ولا حشو. رد بالعربي الخليجي الطبيعي بثبات بدون خلط إنجليزي إلا للمصطلحات أو الأسماء، وإذا كلّمك بلغة ثانية رد بنفس لغته. جملة أو جملتين في العادة (أو أكثر شوي لو طلب شرح مفصّل). قل الأرقام والعملات كما ينطقها الناس. "+
-			"الاستماع: إذا قاطعك وانت تتكلم، اسكت فوراً واسمعه. إذا سكت عشان يفكر، انتظره ولا تعبّي السكوت. لا تعتبر السعال ولا الموسيقى ولا كلام الناس القريبين طلباً جديداً. "+
-			"طلب المساعدة: إذا كان الجواب يعتمد على هذا الجهاز، أو على البيت، أو على ملاحظاته، أو على اليوم (الطقس، أوقات الصلاة، أخبار، أسعار، نتائج مباريات)، أو سأل عن تطبيق أو برنامج أو موقع أو أداة أو منتج أو اسم جديد أو ما أنت متأكد منه 100% — اطلب المساعدة فوراً قبل ما تجاوب، ولا تخمّن النتيجة وانت تنتظر، ولا تقول «لحظة» ولا «ثواني»: الخط يقولها عنك، وانت اسكت لين يجيك الجواب. أما المعلومات العامة الأكيدة والحساب والترجمة والأفكار فجاوبها على طول بذكاء واختصار بدون طلب مساعدة. إذا جاك جواب من المساعدة وهو يكفي، استعمله ولا تطلب من جديد إلا إذا طلب هو تتأكد أو غيّر السؤال. "+
+			"الاستماع: إذا قاطعك وانت تتكلم، اسكت فوراً واسمعه. إذا سكت عشان يفكر، انتظره ولا تعبّي السكوت. لا تعتبر السعال أو الضوضاء الخلفية طلباً، لكن إذا شخص في الغرفة كلّمك بصوت هادي أو من بعيد اسمعه وجاوبه طبيعي. وإذا صحّح لك كلمة أسأت سماعها (مثلاً قال «مطر مو مطار» أو كرّر الكلمة أو ترجمها للإنجليزي مثل rain)، اترك الموضوع الغلط القديم فوراً ولا تعاند ولا ترجع تذكره؛ افهم التصحيح وجاوب على المعنى الصحيح مباشرة. "+
+			"طلب المساعدة: إذا كان الجواب يعتمد على هذا الجهاز، أو على البيت، أو على ملاحظاته، أو على اليوم (الطقس، توقعات الأسبوع، أوقات الصلاة، أخبار، أسعار، نتائج مباريات)، أو سأل عن تطبيق أو برنامج أو موقع أو أداة أو منتج أو اسم جديد أو ما أنت متأكد منه 100% — اطلب المساعدة فوراً قبل ما تجاوب، ولا تخمّن النتيجة وانت تنتظر، ولا تقول «لحظة» ولا «ثواني»: الخط يقولها عنك، وانت اسكت لين يجيك الجواب. أما المعلومات العامة الأكيدة والحساب والترجمة والأفكار فجاوبها على طول بذكاء واختصار بدون طلب مساعدة. إذا جاك جواب من المساعدة وهو يكفي، استعمله ولا تطلب من جديد إلا إذا طلب هو تتأكد أو غيّر السؤال. "+
 			"الذكاء والطبيعية: عملتك الافتراضية دائماً الريال السعودي والسوق الافتراضي السعودية ولا تسأل دولار ولا ريال إلا إذا قال دولار صراحة. إذا السؤال ناقص تفصيل افترض الأكثر شيوعاً وجاوب مباشرة بدون استجواب. ممنوع تماماً تقول «اكتب لي» أو «أرسل صورة» أو «أرسل التهجئة» أو «وين شفته؟» أو «بأي جهاز؟» — هو يكلمك بصوته فقط وما عنده شاشة! وممنوع تختم بجمل آلية مثل «إذا عندك سؤال ثاني أقدر أساعدك». التأكيد فقط لحفظ أو حذف أو إرسال أو شراء. "+
 			"لا ترحّب مرة ثانية في نفس المكالمة ولا تعيد شي قلته. وإذا ما فهمت، قل ذلك بجملة وحدة قصيرة بدون اعتذار طويل ولا اختراع. إذا ودّعك أو طلب تقفل المكالمة، بأي كلمات كانت، لا تودّعه بنفسك: اطلب المساعدة على طول واسكت، والمساعدة هي اللي تودّعه وتقفل الخط.", "system instructions")
 		voice       = flag.String("voice", "", "GPT-Live voice name (empty = provider default)")
 		standbyIdle = flag.Int("standby-idle", 0, "OpenAI Live standby timeout in seconds (5-60); drops idle billing from $0.05/min to $0.02/min while keeping the session warm. 0 disables")
-		standbyVAD  = flag.Float64("standby-vad", 0.5, "VAD speech threshold (0-1) to wake a standby session when --standby-idle is set")
+		standbyVAD  = flag.Float64("standby-vad", 0.25, "VAD speech threshold (0-1) to wake a standby session when --standby-idle is set (0.25 hears quiet/far-field voices reliably)")
+		micAGCdB    = flag.Float64("mic-agc-db", 18, "max adaptive far-field mic boost in dB on Echo -> OpenAI (0 disables; requires libopus.so.0 on Linux)")
 		idle        = flag.Duration("idle-close", 60*time.Second, "close the OpenAI session after this long with no one speaking. Driven by the model's transcript, not by packets: the Echo streams an empty room continuously, so packet arrival never means a person is there. At $0.05 a minute this is what a forgotten session costs")
 		hold      = flag.Duration("hold-after-disconnect", 20*time.Second, "keep the Echo transport open after Alexa's disconnect directive")
 		maxSess   = flag.Duration("max-session", 90*time.Minute, "hard cap per Echo session")
@@ -968,7 +985,7 @@ func main() {
 		homeEPs   = flag.String("home-endpoints", "", "things on the home network the assistant may ask, as name=url,name=url. Read-only, and the model can only pick a name")
 		logSvcs   = flag.String("log-services", "bridge", "which services it may read warnings from, comma separated")
 		bye       = flag.String("farewell", "", "comma-separated phrases that end the call when the user says them. Empty uses the built-in Arabic and English list; \"off\" disables it")
-		byeGrace  = flag.Duration("farewell-grace", 2*time.Second, "how long to wait after hearing a goodbye, so the assistant can finish saying hers and the user can take it back")
+		byeGrace  = flag.Duration("farewell-grace", 800*time.Millisecond, "how long to wait after she stops speaking a goodbye before closing the line")
 		mark      = flag.Bool("spurt-marker", true, "set the RTP marker bit on the first packet after a pause the sender's timestamps do not cover. RFC 3550 gives it the meaning \"first packet of a talkspurt\", which tells a jitter buffer to play silence instead of concealing across the hole")
 		ext       = flag.Bool("ext", false, "negotiate the ssrc-audio-level and transport-cc header extensions the Echo offers. Off by default: it changes what is negotiated with a working Amazon stack, so it is an experiment, not a default")
 		vStream   = flag.String("video-stream-id", "keepalive", "msid stream for the keepalive video. Set to \"rtcdiag\" to share the audio's stream again, which is how it used to be")
@@ -1063,6 +1080,7 @@ func main() {
 		greeting:          *greeting,
 		paceFor:           *pace,
 		markSpurts:        *mark,
+		micAGCdB:          *micAGCdB,
 		byeGrace:          *byeGrace,
 		idleFor:           *idle,
 		holdFor:           *hold,
@@ -1221,7 +1239,7 @@ func main() {
 	hs := &http.Server{Addr: *listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}
 	a.ev("bridge_start", "listen", *listen, "run_dir", lg.RunDir, "pid", os.Getpid(),
 		"voice_model", *model, "backend_model", *backend, "delegation", *deleg,
-		"standby_idle_s", *standbyIdle, "standby_vad", *standbyVAD,
+		"standby_idle_s", *standbyIdle, "standby_vad", *standbyVAD, "mic_agc_db", *micAGCdB,
 		"video", a.cfg.Video, "video_fps", *fps, "idle_close_s", idle.Seconds(),
 		"max_live_s", maxLive.Seconds(), "fork_enabled", *fork, "set_marker", *marker,
 		"ledger", *ledgerP, "record_dir", *recDir,
@@ -1284,16 +1302,16 @@ func splitCSV(s string) []string {
 // farewellMaxWait caps how long a goodbye waits for the assistant to stop talking. Without it a
 // model that never finishes its sentence keeps a billing session open on the strength of the very
 // words that were meant to end it.
-const farewellMaxWait = 10 * time.Second
+const farewellMaxWait = 6 * time.Second
 
 // sidebandLostGrace is how long packet arrival may stand in for the transcript after the control
 // socket is lost for good. With the 60 s idle timer after it, a call whose goodbye can no longer
 // be heard ends within about three minutes instead of at the ten-minute cap.
 const sidebandLostGrace = 2 * time.Minute
 
-// farewellReplyWait is how long his goodbye waits for hers to BEGIN. Measured replies start 1-3 s
+// farewellReplyWait is how long his goodbye waits for hers to BEGIN. Measured replies start 0.8-2 s
 // after his words; a model that says nothing at all ends the call after this instead.
-const farewellReplyWait = 4 * time.Second
+const farewellReplyWait = 2500 * time.Millisecond
 
 // watchFarewell ends the call after the user says goodbye.
 //
