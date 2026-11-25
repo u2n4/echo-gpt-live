@@ -437,3 +437,12 @@ func TestEstimateLiveCostWithStandbyUSD(t *testing.T) {
 		t.Fatalf("effective = %v, want 33s", eff)
 	}
 }
+
+func TestCleanSpokenAnswerStripsCitations(t *testing.T) {
+	in := `سعره أربعة آلاف ريال. ([sa.pricena.com](https://sa.pricena.com/ar/product/iphone?utm_source=openai))`
+	got := cleanSpokenAnswer(in)
+	want := `سعره أربعة آلاف ريال.`
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

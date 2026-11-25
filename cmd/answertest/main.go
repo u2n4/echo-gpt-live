@@ -28,7 +28,7 @@ func main() {
 		keyFile  = flag.String("openai-key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "OpenAI API key file")
 		model    = flag.String("model", openai.SearchModel, "the router model to measure")
 		effort   = flag.String("effort", "", "reasoning effort: empty = the bridge's default, or minimal|low|medium|off")
-		search   = flag.String("web-search", "free", "free|private|off, as in the bridge")
+		search   = flag.String("web-search", "free", "free|private|openai|off, as in the bridge")
 		prefetch = flag.Bool("prefetch", true, "search for the words before the first round, as the bridge does")
 		where    = flag.String("context", "", "what the router is told about where and when (empty = a weekday afternoon)")
 		n        = flag.Int("n", 1, "how many times to ask, for a spread")
@@ -48,15 +48,18 @@ func main() {
 	apiKey := strings.TrimSpace(string(b))
 
 	reg := tools.NewRegistry()
+	payForSearch := false
 	var web *tools.Web
 	switch *search {
 	case "free":
 		web = tools.NewWeb(nil, tools.SearchViaReader)
 	case "private":
 		web = tools.NewWeb(nil, tools.SearchDirect)
+	case "openai":
+		payForSearch = true
 	case "off":
 	default:
-		fmt.Fprintln(os.Stderr, "--web-search must be free, private or off")
+		fmt.Fprintln(os.Stderr, "--web-search must be free, private, openai or off")
 		os.Exit(2)
 	}
 	if web != nil {
@@ -77,7 +80,7 @@ func main() {
 
 	ans := &openai.Answerer{
 		APIKey: apiKey, Model: *model, Tools: reg, OnEvent: ev,
-		MaxOutputTokens: 1500, Deadline: *deadl, Reasoning: *effort,
+		WebSearch: payForSearch, MaxOutputTokens: 1500, Deadline: *deadl, Reasoning: *effort,
 	}
 	if web != nil && *prefetch {
 		ans.Prefetch = web.Speculative
