@@ -8,7 +8,7 @@ require (
 	github.com/pion/ice/v4 v4.4.2
 	github.com/pion/interceptor v0.1.48
 	github.com/pion/rtcp v1.2.17
-	github.com/pion/rtp v1.10.5
+	github.com/pion/rtp v1.10.6
 	github.com/pion/srtp/v3 v3.0.13
 	github.com/pion/webrtc/v4 v4.2.20
 	golang.org/x/sys v0.41.0
