@@ -25,14 +25,15 @@ import (
 
 func main() {
 	var (
-		keyFile  = flag.String("openai-key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "OpenAI API key file")
-		model    = flag.String("model", openai.SearchModel, "the router model to measure")
-		effort   = flag.String("effort", "", "reasoning effort: empty = the bridge's default, or minimal|low|medium|off")
-		search   = flag.String("web-search", "free", "free|private|openai|off, as in the bridge")
-		prefetch = flag.Bool("prefetch", true, "search for the words before the first round, as the bridge does")
-		where    = flag.String("context", "", "what the router is told about where and when (empty = a weekday afternoon)")
-		n        = flag.Int("n", 1, "how many times to ask, for a spread")
-		deadl    = flag.Duration("deadline", 25*time.Second, "the bridge's delegation deadline")
+		keyFile     = flag.String("openai-key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "OpenAI API key file")
+		keenableKey = flag.String("keenable-key-file", os.ExpandEnv("$HOME/.config/acv/keenable.key"), "optional Keenable API key file")
+		model       = flag.String("model", openai.SearchModel, "the router model to measure")
+		effort      = flag.String("effort", "", "reasoning effort: empty = the bridge's default, or minimal|low|medium|off")
+		search      = flag.String("web-search", "free", "free|private|openai|off, as in the bridge")
+		prefetch    = flag.Bool("prefetch", true, "search for the words before the first round, as the bridge does")
+		where       = flag.String("context", "", "what the router is told about where and when (empty = a weekday afternoon)")
+		n           = flag.Int("n", 1, "how many times to ask, for a spread")
+		deadl       = flag.Duration("deadline", 25*time.Second, "the bridge's delegation deadline")
 	)
 	flag.Parse()
 	question := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -49,10 +50,19 @@ func main() {
 
 	reg := tools.NewRegistry()
 	payForSearch := false
+	keenableAPIKey := ""
+	if *keenableKey != "" {
+		if kb, kerr := os.ReadFile(*keenableKey); kerr == nil {
+			keenableAPIKey = strings.TrimSpace(string(kb))
+		}
+	}
+	if keenableAPIKey == "" {
+		keenableAPIKey = strings.TrimSpace(os.Getenv("KEENABLE_API_KEY"))
+	}
 	var web *tools.Web
 	switch *search {
 	case "free":
-		web = tools.NewWeb(nil, tools.SearchViaReader)
+		web = tools.NewWeb(nil, tools.SearchViaReader).SetKeenableKey(keenableAPIKey)
 	case "private":
 		web = tools.NewWeb(nil, tools.SearchDirect)
 	case "openai":

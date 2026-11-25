@@ -959,8 +959,9 @@ func main() {
 		kickSB    = flag.Duration("test-kick-sideband-after", 0, "TEST HOOK, never set in service: this long after the OpenAI leg is up, close its control socket from this side so the reattach path runs against the real service. 0 disables")
 		warm      = flag.Duration("warm-openai", 60*time.Second, "touch OpenAI this often so the HTTPS connection is still open when a call arrives. Measured: creating a session took 1570 ms on a cold connection and 758 ms on a warm one, and every call was cold. Under the 90 s after which Go drops an idle connection. 0 disables")
 		toolsOn   = flag.Bool("tools", false, "let the assistant use tools when it delegates: the machine's state, today's spend, his notes, things on the home network. Off by default because every tool is reachable by anyone who can speak in the room")
-		searchOn  = flag.String("web-search", "free", "how it searches the web. \"free\" costs nothing beyond the few hundred tokens the snippets add: it asks DuckDuckGo directly, and when DuckDuckGo refuses this address as automated traffic (measured on this machine: it does) it goes through the keyless reader at r.jina.ai, which means that service sees the question. \"private\" is the same without the reader, so nobody outside the engine sees it and a block means no answer. \"openai\" is the built-in search at a cent a call, five hundred times more. \"off\" means it cannot search at all")
-		searchMd  = flag.String("search-model", openai.SearchModel, "the cheap model that routes tool calls and runs searches. Not the voice model and not the heavy one")
+		searchOn    = flag.String("web-search", "free", "how it searches the web. \"free\" uses Keenable Search (free tier: 100k/mo with --keenable-key-file or keyless public endpoint) with DuckDuckGo and Wikipedia fallback, costing $0 in search fees. \"private\" queries DuckDuckGo and Wikipedia directly without third-party search APIs. \"openai\" is OpenAI's built-in search at a cent a call. \"off\" disables web search")
+		keenableKey = flag.String("keenable-key-file", os.ExpandEnv("$HOME/.config/acv/keenable.key"), "optional Keenable API key file for free-tier 100k/mo + realtime search (falls back to KEENABLE_API_KEY env or keyless public endpoint)")
+		searchMd    = flag.String("search-model", openai.SearchModel, "the cheap model that routes tool calls and runs searches. Not the voice model and not the heavy one")
 		searchFx  = flag.String("search-effort", "", "how hard the router thinks: minimal|low|medium, or off for a model without reasoning. Empty is low, the least that still decides to use a tool")
 		vaultURL  = flag.String("vault-url", "", "where cmd/vaultd is serving his notes, e.g. http://<pc-on-the-lan>:8791. Empty disables the notes tools")
 		vaultKey  = flag.String("vault-key-file", "", "file holding the shared secret vaultd expects")
@@ -1146,10 +1147,19 @@ func main() {
 		// The two searches are mutually exclusive: both would register the same name, and paying a
 		// cent for the second opinion of a search that already answered is the opposite of the point.
 		payForSearch := false
+		keenableAPIKey := ""
+		if *keenableKey != "" {
+			if kb, kerr := os.ReadFile(*keenableKey); kerr == nil {
+				keenableAPIKey = strings.TrimSpace(string(kb))
+			}
+		}
+		if keenableAPIKey == "" {
+			keenableAPIKey = strings.TrimSpace(os.Getenv("KEENABLE_API_KEY"))
+		}
 		var web *tools.Web
 		switch *searchOn {
 		case "free", "":
-			web = tools.NewWeb(nil, tools.SearchViaReader)
+			web = tools.NewWeb(nil, tools.SearchViaReader).SetKeenableKey(keenableAPIKey)
 		case "private":
 			web = tools.NewWeb(nil, tools.SearchDirect)
 		case "openai":
@@ -1185,7 +1195,7 @@ func main() {
 			f := a.farewell
 			a.assist.hangUp = func(at time.Time) bool { return f.Arm("end_call", at) }
 		}
-		a.ev("tools_ready", "tools", reg.Names(), "web_search", *searchOn, "paid_search", payForSearch, "model", *searchMd)
+		a.ev("tools_ready", "tools", reg.Names(), "web_search", *searchOn, "keenable_key", keenableAPIKey != "", "paid_search", payForSearch, "model", *searchMd)
 	}
 	a.backend = openai.NewBackend(apiKey, *backend)
 	a.backend.OnEvent = a.ev

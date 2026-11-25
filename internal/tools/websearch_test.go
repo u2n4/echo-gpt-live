@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -147,6 +148,66 @@ func TestReaderParse(t *testing.T) {
 	}
 }
 
+func TestKeenableParseAndModes(t *testing.T) {
+	var gotPath, gotKey, gotTitle, gotMode string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotKey = r.Header.Get("X-API-Key")
+		gotTitle = r.Header.Get("X-Keenable-Title")
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotMode, _ = req["mode"].(string)
+		_, _ = w.Write([]byte(`{
+			"mode": "pro",
+			"results": [
+				{
+					"title": "T3 Code App",
+					"url": "https://t3.codes/download",
+					"snippet": "## T3 Code ![logo](/img.svg) **Control** your [coding agents](https://github.com/pingdotgg/t3code) from desktop and phone."
+				}
+			]
+		}`))
+	}))
+	defer srv.Close()
+
+	oldK := keenableBase
+	keenableBase = srv.URL
+	defer func() { keenableBase = oldK }()
+
+	// Authenticated non-realtime query -> /v1/search with mode=pro.
+	hits, err := keenableSearch(context.Background(), srv.Client(), "keen_test123", "T3 Code app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/search" || gotKey != "keen_test123" || gotMode != "pro" {
+		t.Fatalf("pro call got path=%q key=%q mode=%q", gotPath, gotKey, gotMode)
+	}
+	if len(hits) != 1 || !hits[0].Rich || hits[0].Where != "t3.codes" {
+		t.Fatalf("unexpected hit: %+v", hits)
+	}
+	if strings.Contains(hits[0].Snippet, "![") || strings.Contains(hits[0].Snippet, "https://") {
+		t.Fatalf("markdown noise not stripped: %q", hits[0].Snippet)
+	}
+
+	// Authenticated realtime query (Arabic price/news) -> mode=realtime.
+	_, err = keenableSearch(context.Background(), srv.Client(), "keen_test123", "كم سعر الذهب اليوم")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMode != "realtime" {
+		t.Fatalf("expected realtime mode for live price query, got %q", gotMode)
+	}
+
+	// Keyless query -> /v1/search/public with X-Keenable-Title.
+	_, err = keenableSearch(context.Background(), srv.Client(), "", "T3 Code app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/search/public" || gotKey != "" || gotTitle != "echo-gpt-live" {
+		t.Fatalf("keyless call got path=%q key=%q title=%q", gotPath, gotKey, gotTitle)
+	}
+}
+
 // TestLadderFallsThrough proves the ladder does its job: a blocked engine is not the end of the
 // search. Wikipedia is real here because a fake one would test the fake.
 func TestLadderFallsThrough(t *testing.T) {
@@ -159,10 +220,11 @@ func TestLadderFallsThrough(t *testing.T) {
 	}))
 	defer blocked.Close()
 
-	oldD, oldR := ddgBase, readerBase
+	oldK, oldD, oldR := keenableBase, ddgBase, readerBase
+	keenableBase = blocked.URL
 	ddgBase = blocked.URL
-	readerBase = blocked.URL + "/" // the reader is blocked too, so only the encyclopedia is left
-	defer func() { ddgBase, readerBase = oldD, oldR }()
+	readerBase = blocked.URL + "/" // all web engines blocked, so only the encyclopedia is left
+	defer func() { keenableBase, ddgBase, readerBase = oldK, oldD, oldR }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

@@ -237,12 +237,15 @@ func (w *Web) Speculative(ctx context.Context, said string) string {
 		q = string(r[:150]) // an engine wants a phrase, not a paragraph
 	}
 	sctx, cancel := context.WithTimeout(ctx, speculativeWait)
-	hits, err := searchNow(sctx, w.client, w.depth, q)
+	hits, err := searchNow(sctx, w.client, w.depth, w.keenableKey, q)
 	cancel()
 	if err != nil || len(hits) == 0 {
 		return ""
 	}
 	w.keep(hits)
+	if hasRichSnippets(hits) {
+		return render(hits)
+	}
 	// The pages get their own time after the search's, not what the search left over: a slow
 	// engine used to eat the whole allowance and the model started with snippets alone.
 	return render(hits) + w.peek(ctx, hits)

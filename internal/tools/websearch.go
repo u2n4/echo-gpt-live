@@ -31,6 +31,7 @@ package tools
 // openresult.go, and there too the model names a result the engine showed it, never an address.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,12 +45,13 @@ import (
 	"time"
 )
 
-// How much of the web comes back. Six results at 220 characters is enough for the model to answer
-// a spoken question, or to pick the one page worth opening, and short enough that the tokens stay
-// free in all but name.
+// How much of the web comes back. Six results at 220 characters is enough for DDG snippets;
+// Keenable returns clean extracted page excerpts (with prices and facts already pulled out),
+// so we keep up to 520 characters per result and skip the slow extra HTML page peek.
 const (
-	freeResults = 6
-	freeSnippet = 220
+	freeResults     = 6
+	freeSnippet     = 220
+	keenableSnippet = 520
 )
 
 // searchAgent identifies the bridge honestly. An empty User-Agent is served a page with no results
@@ -76,17 +78,21 @@ type webResult struct {
 	// URL is where the result actually leads, decoded from the engine's redirect. The model never
 	// sees it as an address to choose; open_result reaches it by the result's number.
 	URL string
+	// Rich is true when the search backend already extracted substantial clean page text into
+	// Snippet (e.g. Keenable), so Speculative/SearchTool can skip the slow HTML peek step.
+	Rich bool
 }
 
 // Web is the free search and the page it opens afterwards. They share one memory - the results of
 // the last search - so that "open result 3" means something the model was shown, not something
 // it typed.
 type Web struct {
-	client *http.Client // the engines and the reader service
-	pages  *http.Client // result pages: public addresses only, checked at dial time
-	depth  SearchDepth
-	mu     sync.Mutex
-	last   []webResult
+	client      *http.Client // the engines and the reader service
+	pages       *http.Client // result pages: public addresses only, checked at dial time
+	depth       SearchDepth
+	keenableKey string // optional X-API-Key for api.keenable.ai/v1/search (100k/mo free + realtime)
+	mu          sync.Mutex
+	last        []webResult
 }
 
 // NewWeb builds the search and its reader.
@@ -95,6 +101,13 @@ func NewWeb(client *http.Client, depth SearchDepth) *Web {
 		client = &http.Client{Timeout: 8 * time.Second}
 	}
 	return &Web{client: client, pages: pageClient(), depth: depth}
+}
+
+// SetKeenableKey configures an optional Keenable API key (free tier: 100k requests/month +
+// realtime mode). When empty, Keenable's keyless /v1/search/public endpoint is used instead.
+func (w *Web) SetKeenableKey(key string) *Web {
+	w.keenableKey = strings.TrimSpace(key)
+	return w
 }
 
 // WebSearch is the free search tool on its own, for callers that do not open pages.
@@ -148,7 +161,7 @@ func (w *Web) SearchTool() *Tool {
 			if r := []rune(q); len(r) > 300 {
 				q = string(r[:300])
 			}
-			hits, err := searchNow(ctx, w.client, w.depth, q)
+			hits, err := searchNow(ctx, w.client, w.depth, w.keenableKey, q)
 			if err != nil {
 				return "", err
 			}
@@ -156,6 +169,11 @@ func (w *Web) SearchTool() *Tool {
 				return fmt.Sprintf("The search found nothing about %q.", q), nil
 			}
 			w.keep(hits)
+			// Rich backends (Keenable) already return full extracted page excerpts, so skip the
+			// 2.5s raw-HTML peek unless results only have short engine snippets.
+			if hasRichSnippets(hits) {
+				return render(hits), nil
+			}
 			// The first three pages come with the snippets, unasked, so the answer does not
 			// need another round to open them and can speak from more than one site.
 			return render(hits) + w.peek(ctx, hits), nil
@@ -163,32 +181,43 @@ func (w *Web) SearchTool() *Tool {
 	}
 }
 
+func hasRichSnippets(hits []webResult) bool {
+	for _, h := range hits {
+		if h.Rich && len([]rune(h.Snippet)) >= 80 {
+			return true
+		}
+	}
+	return false
+}
+
 // searchNow runs every rung AT ONCE and answers with the best one that came back.
 //
-// It used to be a ladder, tried in order, and the order was the cost. Measured on this machine:
+// Preference is ordered by quality and reliability:
+//   - rank 0: Keenable Search API (independent 100B+ index, rich extracted snippets, ~0.4-0.9s)
+//   - rank 1: DuckDuckGo direct
+//   - rank 2: DuckDuckGo via reader (fallback)
+//   - rank 3: Wikipedia (encyclopedic last resort)
 //
-//	rung 1  DuckDuckGo direct    282 ms and ALWAYS fails - this address is blocked
-//	rung 2  the reader          3744 ms cold, ~1100 ms warm
-//	rung 3  Wikipedia            813 ms
-//
-// So a question about the weather paid 282 ms for a rung that cannot work, then waited 3.7 s for
-// the next one, in series. Run together, the whole thing costs whatever the FIRST usable answer
-// costs, and the dead rung costs nothing at all because nobody waits for it.
-//
-// Preference is still ordered, because "fastest" and "best" are not the same: the engine's own
-// results beat an encyclopedia article for "how hot is it today". So this waits for a better rung
-// only while one is still plausibly coming, and answers the moment the best outstanding one lands.
-func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, q string) ([]webResult, error) {
+// Running together means a dead or blocked rung adds zero serial latency, and the moment the best
+// outstanding rung lands, every lower rung is cancelled immediately.
+func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, keenableKey, q string) ([]webResult, error) {
 	type rung struct {
-		rank int // lower is better; the engine beats the encyclopedia
+		rank int // lower is better
 		name string
 		run  func(context.Context, *http.Client, string) ([]webResult, error)
 	}
-	rungs := []rung{{0, "direct", ddgDirect}}
+	var rungs []rung
 	if depth >= SearchViaReader {
-		rungs = append(rungs, rung{1, "reader", ddgViaReader})
+		key := keenableKey
+		rungs = append(rungs, rung{0, "keenable", func(ctx context.Context, c *http.Client, q string) ([]webResult, error) {
+			return keenableSearch(ctx, c, key, q)
+		}})
 	}
-	rungs = append(rungs, rung{2, "wikipedia", wikipediaSearch})
+	rungs = append(rungs, rung{1, "direct", ddgDirect})
+	if depth >= SearchViaReader {
+		rungs = append(rungs, rung{2, "reader", ddgViaReader})
+	}
+	rungs = append(rungs, rung{3, "wikipedia", wikipediaSearch})
 
 	type answer struct {
 		rank int
@@ -271,11 +300,116 @@ func render(hits []webResult) string {
 			b.WriteString(" (" + oneLine(r.Where, 60) + ")")
 		}
 		if r.Snippet != "" {
-			b.WriteString(": " + oneLine(r.Snippet, freeSnippet))
+			limit := freeSnippet
+			if r.Rich {
+				limit = keenableSnippet
+			}
+			b.WriteString(": " + oneLine(r.Snippet, limit))
 		}
 		b.WriteString("\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// ---- rung zero: Keenable Search API (independent index, rich extracted snippets) ----
+
+// keenableBase is a variable only so tests can point this at a local httptest server.
+var keenableBase = "https://api.keenable.ai"
+
+var (
+	// realtimeCueRE picks Keenable's realtime mode for breaking news, live prices, scores, and
+	// today's events; everything else uses Keenable's pro mode (higher accuracy on apps/docs/facts).
+	realtimeCueRE = regexp.MustCompile(`(?i)اليوم|امس|أمس|الآن|الان|عاجل|اخبار|أخبار|خبر|مباراه|مباراة|نتيجه|نتيجة|نتائج|فاز|سعر|اسعار|أسعار|بكم|الذهب|الدولار|سهم|اسهم|بيتكوين|طقس|الجو|وش صار|اخر|آخر|` +
+		`today|yesterday|now|breaking|news|score|match|who won|price|cost|gold|dollar|stock|bitcoin|weather|latest|live`)
+	mdImageRE = regexp.MustCompile(`!\[[^\]]*\]\([^)]*\)`)
+	mdLinkRE  = regexp.MustCompile(`\[([^\]]+)\]\(https?://[^)]+\)`)
+)
+
+func cleanKeenableSnippet(s string) string {
+	s = mdImageRE.ReplaceAllString(s, " ")
+	s = mdLinkRE.ReplaceAllString(s, "$1")
+	s = strings.ReplaceAll(s, "###", " ")
+	s = strings.ReplaceAll(s, "##", " ")
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "|", " ")
+	return clean(s)
+}
+
+func keenableSearch(ctx context.Context, client *http.Client, apiKey, q string) ([]webResult, error) {
+	endpoint := strings.TrimRight(keenableBase, "/") + "/v1/search/public"
+	payload := map[string]any{
+		"query": q,
+	}
+	if apiKey != "" {
+		endpoint = strings.TrimRight(keenableBase, "/") + "/v1/search"
+		mode := "pro"
+		if realtimeCueRE.MatchString(q) {
+			mode = "realtime"
+		}
+		payload["mode"] = mode
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("User-Agent", searchAgent)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	} else {
+		req.Header.Set("X-Keenable-Title", "echo-gpt-live")
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 512<<10))
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode >= 400 {
+		return nil, fmt.Errorf("answered %d", res.StatusCode)
+	}
+	var parsed struct {
+		Results []struct {
+			Title       string `json:"title"`
+			URL         string `json:"url"`
+			Description string `json:"description"`
+			Snippet     string `json:"snippet"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("unreadable keenable response: %w", err)
+	}
+	var out []webResult
+	for _, r := range parsed.Results {
+		title := clean(r.Title)
+		if title == "" {
+			continue
+		}
+		snip := r.Snippet
+		if strings.TrimSpace(snip) == "" {
+			snip = r.Description
+		}
+		snip = cleanKeenableSnippet(snip)
+		u := resultURL(r.URL)
+		out = append(out, webResult{
+			Title:   title,
+			Snippet: snip,
+			Where:   host(u),
+			URL:     u,
+			Rich:    true,
+		})
+		if len(out) >= freeResults {
+			break
+		}
+	}
+	return out, nil
 }
 
 // ---- rung one: the engine itself ----
@@ -484,11 +618,11 @@ func get(ctx context.Context, client *http.Client, u string, limit int64, hdr ma
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, limit))
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
 	if res.StatusCode >= 400 {
 		return nil, fmt.Errorf("answered %d", res.StatusCode)
+	}
+	if err != nil {
+		return nil, err
 	}
 	return body, nil
 }
