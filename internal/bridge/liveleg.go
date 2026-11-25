@@ -96,6 +96,13 @@ type LiveLeg struct {
 	// close a conversation that is still happening.
 	sidebandLive   atomic.Bool
 	sidebandLostAt atomic.Int64 // unix nanos when the reader gave up for good; 0 otherwise
+	// paused tracks OpenAI Live standby mode (session.paused / session.resumed). While paused,
+	// active inference is suspended at the lower standby rate and the sideband may stop emitting
+	// audio heartbeats, so the stall watcher must not kick a legitimately paused socket.
+	paused      atomic.Bool
+	pauseMu     sync.Mutex
+	pauseStart  time.Time
+	pausedTotal time.Duration
 }
 
 type liveStartup struct {
@@ -294,6 +301,67 @@ func (l *LiveLeg) Age() time.Duration {
 // Sideband exposes the control socket so commentary and thinking can be appended.
 func (l *LiveLeg) Sideband() *openai.LiveSideband { return l.sideband }
 
+// Paused reports whether the OpenAI Live session is currently in standby mode.
+func (l *LiveLeg) Paused() bool { return l.paused.Load() }
+
+// PausedDuration returns the total time this session has spent in standby mode.
+func (l *LiveLeg) PausedDuration() time.Duration {
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	total := l.pausedTotal
+	if !l.pauseStart.IsZero() {
+		end := time.Now()
+		if closed := l.endedAt.Load(); closed != 0 {
+			end = time.Unix(0, closed)
+		}
+		if d := end.Sub(l.pauseStart); d > 0 {
+			total += d
+		}
+	}
+	return total
+}
+
+func (l *LiveLeg) setPaused(p bool) {
+	l.pauseMu.Lock()
+	var dur time.Duration
+	changed := false
+	if p {
+		if l.pauseStart.IsZero() {
+			l.pauseStart = time.Now()
+			l.paused.Store(true)
+			changed = true
+		}
+	} else {
+		if !l.pauseStart.IsZero() {
+			dur = time.Since(l.pauseStart)
+			if dur > 0 {
+				l.pausedTotal += dur
+			}
+			l.pauseStart = time.Time{}
+			l.paused.Store(false)
+			changed = true
+		} else {
+			l.paused.Store(false)
+		}
+	}
+	l.pauseMu.Unlock()
+	if !changed {
+		return
+	}
+	if p {
+		if l.ev != nil {
+			l.ev("live_session_paused", "session_id", l.SessionID)
+		}
+		return
+	}
+	if l.sideband != nil {
+		l.sideband.Touch()
+	}
+	if l.ev != nil {
+		l.ev("live_session_resumed", "session_id", l.SessionID, "paused_ms", dur.Milliseconds())
+	}
+}
+
 // DialLive builds the OpenAI-facing PeerConnection, creates (or forks) a GPT-Live session, and
 // returns once the SDP answer has been applied. forkFrom, when non-empty, resumes a stored
 // session instead of starting a new conversation.
@@ -385,8 +453,14 @@ func DialLive(
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		t := eventType(msg.Data)
 		ev("live_dc_event", "type", t, "bytes", len(msg.Data))
-		if t == "session.started" {
+		switch t {
+		case "session.started":
 			startup.started()
+			l.setPaused(false)
+		case "session.paused":
+			l.setPaused(true)
+		case "session.resumed":
+			l.setPaused(false)
 		}
 	})
 
@@ -464,8 +538,16 @@ func DialLive(
 		}
 		handle := func(typ string, raw []byte) {
 			ev("live_sideband_event", "type", typ)
-			if typ == "session.started" {
+			switch typ {
+			case "session.started":
 				startup.started()
+				l.setPaused(false)
+			case "session.paused":
+				l.setPaused(true)
+			case "session.resumed", "session.input_transcript.delta", "session.output_transcript.delta":
+				if l.paused.Load() {
+					l.setPaused(false)
+				}
 			}
 			if h := l.onSidebandEvent.Load(); h != nil {
 				(*h)(typ, raw)
@@ -529,7 +611,7 @@ func DialLive(
 				out := l.outPkts.Load()
 				sending := out > lastOut
 				lastOut = out
-				if !sending || !l.sidebandLive.Load() || sb.Silent() < sidebandStallAfter {
+				if !sending || !l.sidebandLive.Load() || l.paused.Load() || sb.Silent() < sidebandStallAfter {
 					continue
 				}
 				ev("live_sideband_stalled", "silent_s", sb.Silent().Seconds(),
@@ -654,8 +736,10 @@ func (l *LiveLeg) Close(reason string) {
 		l.endedAt.CompareAndSwap(0, time.Now().UnixNano())
 		in, out, firstMs := l.Stats()
 		age := l.Age()
+		paused := l.PausedDuration()
 		l.ev("live_leg_close", "reason", reason, "session_id", l.SessionID,
-			"age_s", age.Seconds(), "billed_usd_estimate", openai.EstimateLiveCostUSD(age),
+			"age_s", age.Seconds(), "paused_s", paused.Seconds(),
+			"billed_usd_estimate", openai.EstimateLiveCostWithStandbyUSD(age, paused),
 			"pkts_from_openai", in, "pkts_to_openai", out, "first_audio_ms", firstMs)
 		if l.SessionID != "" {
 			// Stop the clock first, and keep trying: a failed hangup leaves money running.
@@ -672,7 +756,7 @@ func (l *LiveLeg) Close(reason string) {
 			// as stale used to record only the init charge, because the caller's close was the
 			// only place that charged. Found by the 2026-09-16 fleet.
 			if l.client.Budget != nil {
-				l.client.Budget.Spent(age)
+				l.client.Budget.Spent(openai.EffectiveBilledDuration(age, paused))
 			}
 		}
 		// Cancel BEFORE closing the socket: the reader tells a socket that died from one that

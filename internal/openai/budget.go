@@ -25,8 +25,11 @@ import (
 	"time"
 )
 
-// LiveRatePerMinuteUSD is what gpt-live-1 charges for a connected session, silence included.
+// LiveRatePerMinuteUSD is what gpt-live charges for an active connected session.
 const LiveRatePerMinuteUSD = 0.05
+
+// LiveStandbyRatePerMinuteUSD is what gpt-live charges while paused in standby mode.
+const LiveStandbyRatePerMinuteUSD = 0.02
 
 // ErrBudgetSpent is returned when the day's ceiling has been reached.
 var ErrBudgetSpent = errors.New("daily GPT-Live budget spent")

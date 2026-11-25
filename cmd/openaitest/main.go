@@ -45,10 +45,14 @@ func main() {
 	var (
 		keyFile  = flag.String("key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "file holding the OpenAI API key")
 		api      = flag.String("api", "live", "live|realtime - which voice API to exercise")
-		model    = flag.String("model", "", "voice model (default gpt-live-1 for live, gpt-realtime-2.1-mini for realtime)")
-		backend  = flag.String("backend", openai.BackendModel, "delegation backend model for heavy work")
-		deleg    = flag.String("delegation", "client", "client|responses|none - client keeps the effort choice in this bridge")
-		effort   = flag.String("backend-effort", openai.BackendEffortDefault, "fixed effort when --delegation responses")
+		model       = flag.String("model", "", "voice model (default gpt-live-1.1 for live, gpt-realtime-2.1-mini for realtime)")
+		backend     = flag.String("backend", openai.BackendModel, "delegation backend model for heavy work")
+		deleg       = flag.String("delegation", "client", "client|responses|none - client keeps the effort choice in this bridge")
+		effort      = flag.String("backend-effort", openai.BackendEffortDefault, "fixed effort when --delegation responses")
+		standbyIdle = flag.Int("standby-idle", 0, "OpenAI Live standby timeout in seconds (5-60); 0 disables")
+		standbyVAD  = flag.Float64("standby-vad", 0.5, "VAD threshold (0-1) to wake standby")
+		sayHello    = flag.Bool("say-hello", false, "send commentary \"هلا.\" right after session.started (matches bridge startup)")
+		speakDelay  = flag.Duration("speak-delay", 0, "wait this long after session.started before sending --audio-file")
 		idle     = flag.Duration("idle-close", 90*time.Second, "close the session after this long without speech (GPT-Live bills silence)")
 		ask      = flag.String("ask-backend", "", "also send this question to the backend model and report time and cost")
 		askKind  = flag.String("ask-kind", "", "tool|quick|hard - selects the reasoning effort for --ask-backend")
@@ -321,6 +325,11 @@ func main() {
 			// the Echo tearing its own RTC session down.
 			Store: &store,
 		}
+		if *standbyIdle > 0 {
+			vad := *standbyVAD
+			cfg.IdleTimeoutS = *standbyIdle
+			cfg.WakePolicy = &openai.WakePolicy{Type: "speech", VADThreshold: &vad}
+		}
 		switch *deleg {
 		case "client":
 			cfg.Delegation = openai.ClientDelegation()
@@ -353,10 +362,12 @@ func main() {
 			hangup()
 			os.Exit(1)
 		}
+		var liveSB *openai.LiveSideband
 		if sb, aerr := lc.Attach(runCtx, ls.ID); aerr != nil {
 			// not fatal: the data channel still carries events
 			lg.Event("live_attach_failed", "err", aerr.Error())
 		} else {
+			liveSB = sb
 			defer func() {
 				if err := sb.Close(); err != nil {
 					lg.Event("live_sideband_close_failed", "err", err.Error())
@@ -379,6 +390,15 @@ func main() {
 			hangup()
 		case <-dcStarted:
 			lg.Event("live_session_started", "ms_since_start", time.Since(start).Milliseconds())
+			if *sayHello && liveSB != nil {
+				hctx, hcancel := context.WithTimeout(runCtx, 5*time.Second)
+				if err := liveSB.Commentary(hctx, "", "هلا."); err != nil {
+					lg.Event("hello_failed", "err", err.Error())
+				} else {
+					lg.Event("hello_sent", "ms_since_start", time.Since(start).Milliseconds())
+				}
+				hcancel()
+			}
 		case <-time.After(15 * time.Second):
 			lg.Event("live_session_started_timeout", "note", "no session.started arrived on the data channel")
 		}
@@ -482,8 +502,18 @@ func main() {
 		}
 	}
 
-	// speak the file once (now, unless --speak-at connected already did), then listen
-	speak("started")
+	// speak the file once (now or after --speak-delay, unless --speak-at connected already did), then listen
+	if *speakDelay > 0 {
+		go func() {
+			select {
+			case <-time.After(*speakDelay):
+				speak("started")
+			case <-runCtx.Done():
+			}
+		}()
+	} else {
+		speak("started")
+	}
 	<-runCtx.Done()
 
 	hangup()

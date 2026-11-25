@@ -942,13 +942,15 @@ func main() {
 		// about not greeting twice and reusing a result that still answers are there because the
 		// 20:52 call of 2026-09-13 did both, and the one-word start is so he knows she can hear
 		// without a greeting long enough to talk over him.
-		instr = flag.String("instructions", "انت \"سول\"، مساعد صوتي في البيت.هادي ومختصر وودود بدون مبالغة. رد بالعربي الخليجي إلا إذا كلّمك بلغة ثانية. جملة أو جملتين، لا أكثر، لأن كلامك ينطق من سمّاعة صغيرة. قل الأرقام كما ينطقها الناس. "+
+		instr = flag.String("instructions", "انت \"أسترا\"، مساعد صوتي ذكي في البيت، هادي ومختصر وودود بدون مبالغة. رد بالعربي الخليجي الطبيعي بثبات بدون خلط إنجليزي إلا للمصطلحات أو الأسماء، وإذا كلّمك بلغة ثانية رد بنفس لغته. جملة أو جملتين في العادة لأن كلامك ينطق من سمّاعة صغيرة (إلا إذا طلب شرح مفصّل). قل الأرقام والعملات كما ينطقها الناس. "+
 			"الاستماع: إذا قاطعك وانت تتكلم، اسكت فوراً واسمعه. إذا سكت عشان يفكر، انتظره ولا تعبّي السكوت. لا تعتبر السعال ولا الموسيقى ولا كلام الناس القريبين طلباً جديداً. "+
-			"طلب المساعدة: إذا كان الجواب يعتمد على هذا الجهاز، أو على البيت، أو على ملاحظاته، أو على اليوم، أو على أخبار أو أسعار أو نتائج أو أي شي بعد تدريبك — اطلب المساعدة قبل ما تجاوب، ولا تخمّن النتيجة وانت تنتظر، ولا تقول «لحظة» ولا «ثواني»: الخط يقولها عنك، وانت اسكت لين يجيك الجواب. وإذا تعرف الجواب فجاوب على طول؛ طلب مساعدة ما تحتاجها يخليه ينتظر ويكلّفه. إذا جاك جواب من المساعدة وهو يكفي، استعمله ولا تطلب من جديد إلا إذا طلب هو تتأكد أو غيّر السؤال. "+
+			"طلب المساعدة: إذا كان الجواب يعتمد على هذا الجهاز، أو على البيت، أو على ملاحظاته، أو على اليوم (الطقس، أوقات الصلاة، أخبار، أسعار، نتائج مباريات، أو أي شي بعد تدريبك) — اطلب المساعدة قبل ما تجاوب، ولا تخمّن النتيجة وانت تنتظر، ولا تقول «لحظة» ولا «ثواني»: الخط يقولها عنك، وانت اسكت لين يجيك الجواب. أما المعلومات العامة والحساب والترجمة والأفكار اللي تعرفها فجاوبها على طول بذكاء واختصار بدون طلب مساعدة عشان ما تأخره ولا تكلّفه. إذا جاك جواب من المساعدة وهو يكفي، استعمله ولا تطلب من جديد إلا إذا طلب هو تتأكد أو غيّر السؤال. "+
 			"الذكاء: عملتك الافتراضية دائماً الريال السعودي ولا تسأل دولار ولا ريال إلا إذا هو قال دولار صراحة. السوق الافتراضي السعودية. إذا السؤال ناقص تفصيل افترض الأكثر شيوعاً عندنا وجاوب به واذكر افتراضك داخل الجواب. ممنوع أسئلة توضيحية إلا إذا استحال الجواب بدونها. ممنوع تطلب تأكيد ولا تقول تبغاني أكمل؛ التأكيد فقط لحفظ أو حذف أو إرسال أو شراء. "+
 			"لا ترحّب مرة ثانية في نفس المكالمة ولا تعيد شي قلته. وإذا ما فهمت، قل ذلك بجملة وحدة ولا تخترع. إذا ودّعك أو طلب تقفل المكالمة، بأي كلمات كانت، لا تودّعه بنفسك: اطلب المساعدة على طول واسكت، والمساعدة هي اللي تودّعه وتقفل الخط.", "system instructions")
-		voice     = flag.String("voice", "", "GPT-Live voice name (empty = provider default)")
-		idle      = flag.Duration("idle-close", 60*time.Second, "close the OpenAI session after this long with no one speaking. Driven by the model's transcript, not by packets: the Echo streams an empty room continuously, so packet arrival never means a person is there. At $0.05 a minute this is what a forgotten session costs")
+		voice       = flag.String("voice", "", "GPT-Live voice name (empty = provider default)")
+		standbyIdle = flag.Int("standby-idle", 0, "OpenAI Live standby timeout in seconds (5-60); drops idle billing from $0.05/min to $0.02/min while keeping the session warm. 0 disables")
+		standbyVAD  = flag.Float64("standby-vad", 0.5, "VAD speech threshold (0-1) to wake a standby session when --standby-idle is set")
+		idle        = flag.Duration("idle-close", 60*time.Second, "close the OpenAI session after this long with no one speaking. Driven by the model's transcript, not by packets: the Echo streams an empty room continuously, so packet arrival never means a person is there. At $0.05 a minute this is what a forgotten session costs")
 		hold      = flag.Duration("hold-after-disconnect", 20*time.Second, "keep the Echo transport open after Alexa's disconnect directive")
 		maxSess   = flag.Duration("max-session", 90*time.Minute, "hard cap per Echo session")
 		marker    = flag.Bool("set-marker", false, "set marker=true on packets forwarded to OpenAI (undocumented; the one prior-art bridge did this)")
@@ -1016,6 +1018,19 @@ func main() {
 		Model:        *model,
 		Instructions: *instr,
 		Store:        &store, // only --fork asks for storage, which a project may forbid
+	}
+	if *standbyIdle != 0 {
+		if *standbyIdle < 5 || *standbyIdle > 60 {
+			fmt.Fprintf(os.Stderr, "--standby-idle must be 0 (off) or between 5 and 60 seconds, got %d\n", *standbyIdle)
+			os.Exit(2)
+		}
+		if *standbyVAD < 0 || *standbyVAD > 1 {
+			fmt.Fprintf(os.Stderr, "--standby-vad must be between 0 and 1, got %v\n", *standbyVAD)
+			os.Exit(2)
+		}
+		vad := *standbyVAD
+		sessCfg.IdleTimeoutS = *standbyIdle
+		sessCfg.WakePolicy = &openai.WakePolicy{Type: "speech", VADThreshold: &vad}
 	}
 	// audio.format is deliberately omitted on both sides: WebRTC negotiates it through SDP.
 	sessCfg.Audio = map[string]any{}
@@ -1196,6 +1211,7 @@ func main() {
 	hs := &http.Server{Addr: *listen, Handler: srv, ReadHeaderTimeout: 10 * time.Second}
 	a.ev("bridge_start", "listen", *listen, "run_dir", lg.RunDir, "pid", os.Getpid(),
 		"voice_model", *model, "backend_model", *backend, "delegation", *deleg,
+		"standby_idle_s", *standbyIdle, "standby_vad", *standbyVAD,
 		"video", a.cfg.Video, "video_fps", *fps, "idle_close_s", idle.Seconds(),
 		"max_live_s", maxLive.Seconds(), "fork_enabled", *fork, "set_marker", *marker,
 		"ledger", *ledgerP, "record_dir", *recDir,

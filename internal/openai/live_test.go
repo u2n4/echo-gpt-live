@@ -378,3 +378,62 @@ func TestASessionTheCounterCannotRecordAndTheHangupCannotCloseGoesOnTheLedger(t 
 		t.Fatalf("the lost session must be on the ledger for the sweep, got %v", got)
 	}
 }
+
+func TestCreateSessionDropsStandbyWhenRejected(t *testing.T) {
+	const rejected = `{"error":{"code":"unknown_parameter","message":"Unknown parameter: 'session.wake_policy'."}}`
+	srv, seen := liveCreateServer(t, rejected)
+	defer srv.Close()
+	c := clientAt(srv)
+
+	vad := 0.5
+	cfg := LiveSessionConfig{
+		Model:        LiveModel,
+		IdleTimeoutS: 15,
+		WakePolicy:   &WakePolicy{Type: "speech", VADThreshold: &vad},
+	}
+	sess, err := c.CreateSession(context.Background(), "v=0\r\n", cfg)
+	if err != nil {
+		t.Fatalf("the session must survive rejected standby parameters: %v", err)
+	}
+	if sess.ID != "live_ok" {
+		t.Fatalf("session id = %q", sess.ID)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(*seen))
+	}
+	if _, ok := (*seen)[0]["wake_policy"]; !ok {
+		t.Fatal("first attempt should carry wake_policy")
+	}
+	if _, ok := (*seen)[0]["idle_timeout_s"]; !ok {
+		t.Fatal("first attempt should carry idle_timeout_s")
+	}
+	if _, ok := (*seen)[1]["wake_policy"]; ok {
+		t.Fatal("retry must omit wake_policy")
+	}
+	if _, ok := (*seen)[1]["idle_timeout_s"]; ok {
+		t.Fatal("retry must omit idle_timeout_s")
+	}
+	if _, err := c.CreateSession(context.Background(), "v=0\r\n", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(*seen) != 3 {
+		t.Fatalf("total attempts = %d, want 3", len(*seen))
+	}
+	if _, ok := (*seen)[2]["wake_policy"]; ok {
+		t.Fatal("wake_policy was resent after being refused")
+	}
+}
+
+func TestEstimateLiveCostWithStandbyUSD(t *testing.T) {
+	got := EstimateLiveCostWithStandbyUSD(60*1e9, 45*1e9)
+	want := 0.0275
+	if diff := got - want; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("cost = %.6f, want %.6f", got, want)
+	}
+	if floor := EstimateLiveCostWithStandbyUSD(5*1e9, 5*1e9); floor < 0.0124 || floor > 0.0126 {
+		t.Fatalf("floor = %.6f, want 0.0125", floor)
+	}
+	if eff := EffectiveBilledDuration(60*1e9, 45*1e9); eff != 33*1e9 {
+		t.Fatalf("effective = %v, want 33s", eff)
+	}
+}

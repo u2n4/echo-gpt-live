@@ -50,10 +50,10 @@ const (
 	// LiveDataChannelLabel is the label the docs require for the events channel.
 	LiveDataChannelLabel = "oai-events"
 	// LiveModel is the full-duplex voice model: "It can listen and speak at the same time."
-	LiveModel = "gpt-live-1"
+	LiveModel = "gpt-live-1.1"
 	// BackendModel is the delegation backend. Luna is the cost-sensitive tier OpenAI lists for
 	// delegation; at $0.20/$1.20 per 1M a hard question costs about a cent.
-	BackendModel = "gpt-5.6-luna"
+	BackendModel = "gpt-6-luna"
 	// BackendEffortDefault keeps latency usable. Measured time to first answer token
 	// (Artificial Analysis): medium is seconds, xhigh 43.81 s, max 134.29 s — so xhigh is an
 	// announced escalation and max never belongs in a voice path.
@@ -127,6 +127,12 @@ func BackendEffortFor(kind string) string {
 	}
 }
 
+// WakePolicy configures how a GPT-Live session wakes from standby mode.
+type WakePolicy struct {
+	Type         string   `json:"type"`                    // "speech"
+	VADThreshold *float64 `json:"vad_threshold,omitempty"` // 0..1 (default 0.5)
+}
+
 // LiveSessionConfig is the `session` object of the create request.
 type LiveSessionConfig struct {
 	Model        string         `json:"model"`
@@ -134,6 +140,8 @@ type LiveSessionConfig struct {
 	Delegation   *Delegation    `json:"delegation,omitempty"`
 	Store        *bool          `json:"store,omitempty"` // required for fork; recordings expire in 30 days
 	Audio        map[string]any `json:"audio,omitempty"` // omit `format` on WebRTC: SDP negotiates it
+	WakePolicy   *WakePolicy    `json:"wake_policy,omitempty"`
+	IdleTimeoutS int            `json:"idle_timeout_s,omitempty"` // 5..60 seconds; 0 = disabled
 	Extra        map[string]any `json:"-"`
 }
 
@@ -150,6 +158,9 @@ type LiveClient struct {
 	// audioInputDenied records that this deployment rejects session.audio.input, so later calls
 	// stop sending it instead of paying a failed round trip per session.
 	audioInputDenied atomic.Bool
+	// standbyDenied records that this deployment rejects wake_policy or idle_timeout_s, so later
+	// calls skip them rather than paying a failed round trip per session.
+	standbyDenied atomic.Bool
 	// Budget is the day's spending ceiling, shared on disk with every other process on this
 	// machine. Nil means no ceiling. It is checked BEFORE a session is created, because after the
 	// session exists the money is already committed.
@@ -314,6 +325,16 @@ func AudioInputDenied(err error) bool {
 		strings.Contains(ae.Message, "session.audio.input")
 }
 
+// StandbyDenied reports the API refusing wake_policy or idle_timeout_s.
+func StandbyDenied(err error) bool {
+	var ae *apiError
+	if err == nil || !errors.As(err, &ae) {
+		return false
+	}
+	return (ae.Code == "unknown_parameter" || ae.Code == "invalid_value" || ae.Type == "invalid_request_error") &&
+		(strings.Contains(ae.Message, "wake_policy") || strings.Contains(ae.Message, "idle_timeout_s"))
+}
+
 // CreateSession posts the SDP offer and returns the answer plus the opaque session id.
 //
 // store:true is requested because it is what makes Fork possible, and Fork is how a conversation
@@ -325,14 +346,19 @@ func (c *LiveClient) CreateSession(ctx context.Context, offerSDP string, cfg Liv
 		return nil, err
 	}
 	sess, err := c.createOnce(ctx, offerSDP, cfg)
-	// Each refusal is retried at most once, and the two can stack: the first attempt is refused
-	// for audio.input, the second for store. Handling them as separate one-shot branches meant
-	// the second refusal was returned as the error (found by the 2026-09-16 fleet).
+	// Each refusal is retried at most once, and refusals can stack: audio.input, standby, store.
 	if err != nil && AudioInputDenied(err) {
 		// An audio tuning parameter must never be the reason the assistant does not answer.
 		c.event("live_audio_input_not_supported", "action", "retrying without session.audio.input",
-			"note", "gpt-live-1 accepts audio.output only; input noise reduction is a Realtime API feature")
+			"note", "gpt-live accepts audio.output only; input noise reduction is a Realtime API feature")
 		c.audioInputDenied.Store(true)
+		sess, err = c.createOnce(ctx, offerSDP, cfg)
+	}
+	if err != nil && StandbyDenied(err) {
+		// Standby is a cost optimization and must never prevent a call from starting.
+		c.event("live_standby_not_supported", "action", "retrying without wake_policy/idle_timeout_s",
+			"err", err.Error())
+		c.standbyDenied.Store(true)
 		sess, err = c.createOnce(ctx, offerSDP, cfg)
 	}
 	if err != nil && StorageDenied(err) && cfg.Store != nil && *cfg.Store {
@@ -385,6 +411,14 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 		}
 		if len(audio) > 0 {
 			sessionObj["audio"] = audio
+		}
+	}
+	if !c.standbyDenied.Load() {
+		if cfg.WakePolicy != nil {
+			sessionObj["wake_policy"] = cfg.WakePolicy
+		}
+		if cfg.IdleTimeoutS > 0 {
+			sessionObj["idle_timeout_s"] = cfg.IdleTimeoutS
 		}
 	}
 	for k, v := range cfg.Extra {
@@ -570,6 +604,13 @@ func (s *LiveSideband) Reattach(ctx context.Context) error {
 // Silent reports how long the socket has delivered nothing.
 func (s *LiveSideband) Silent() time.Duration {
 	return time.Since(time.Unix(0, s.lastEvent.Load()))
+}
+
+// Touch resets the silence clock, used when a paused (standby) session resumes.
+func (s *LiveSideband) Touch() {
+	if s != nil {
+		s.lastEvent.Store(time.Now().UnixNano())
+	}
 }
 
 // Kick closes the current socket so a Read blocked on it returns. The sideband itself stays.
@@ -826,9 +867,38 @@ func (g *IdleGate) run() {
 // EstimateLiveCostUSD returns the wall-clock cost of a GPT-Live session, including the 15 seconds
 // billed at initialization (credited, so the floor is 15 s rather than the elapsed time).
 func EstimateLiveCostUSD(elapsed time.Duration) float64 {
-	sec := elapsed.Seconds()
-	if sec < liveInitBilledSeconds {
-		sec = liveInitBilledSeconds
+	return EstimateLiveCostWithStandbyUSD(elapsed, 0)
+}
+
+// EstimateLiveCostWithStandbyUSD returns the estimated cost of a GPT-Live session where paused
+// time was billed at the lower standby rate ($0.02/min) and active time at $0.05/min, honoring
+// the 15-second initialization floor.
+func EstimateLiveCostWithStandbyUSD(elapsed, paused time.Duration) float64 {
+	if paused < 0 {
+		paused = 0
 	}
-	return sec / 60.0 * 0.05
+	if paused > elapsed {
+		paused = elapsed
+	}
+	active := elapsed - paused
+	cost := active.Seconds()/60.0*LiveRatePerMinuteUSD + paused.Seconds()/60.0*LiveStandbyRatePerMinuteUSD
+	floor := float64(liveInitBilledSeconds) / 60.0 * LiveRatePerMinuteUSD
+	if cost < floor {
+		return floor
+	}
+	return cost
+}
+
+// EffectiveBilledDuration converts an active+standby session duration into its equivalent
+// active-rate duration for the single-rate daily budget ledger.
+func EffectiveBilledDuration(elapsed, paused time.Duration) time.Duration {
+	if paused <= 0 {
+		return elapsed
+	}
+	if paused > elapsed {
+		paused = elapsed
+	}
+	active := elapsed - paused
+	scaled := float64(paused) * (LiveStandbyRatePerMinuteUSD / LiveRatePerMinuteUSD)
+	return active + time.Duration(scaled)
 }

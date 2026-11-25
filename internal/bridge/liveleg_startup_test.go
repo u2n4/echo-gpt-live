@@ -173,3 +173,33 @@ func TestDetachingDropsLiveStartupAudio(t *testing.T) {
 		t.Fatal("startup hold was not cleared")
 	}
 }
+
+func TestLiveLegStandbyPauseAndResume(t *testing.T) {
+	var events []string
+	l := &LiveLeg{
+		SessionID: "live_test",
+		ev: func(ev string, _ ...any) {
+			events = append(events, ev)
+		},
+	}
+	if l.Paused() {
+		t.Fatal("new leg must not start paused")
+	}
+	l.setPaused(true)
+	l.setPaused(true)
+	if !l.Paused() {
+		t.Fatal("leg should report paused after session.paused")
+	}
+	time.Sleep(25 * time.Millisecond)
+	l.setPaused(false)
+	l.setPaused(false)
+	if l.Paused() {
+		t.Fatal("leg should not report paused after session.resumed")
+	}
+	if d := l.PausedDuration(); d < 20*time.Millisecond {
+		t.Fatalf("PausedDuration = %v, want >= 20ms", d)
+	}
+	if len(events) != 2 || events[0] != "live_session_paused" || events[1] != "live_session_resumed" {
+		t.Fatalf("events = %v, want [live_session_paused live_session_resumed]", events)
+	}
+}
