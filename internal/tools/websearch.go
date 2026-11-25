@@ -121,11 +121,11 @@ func (w *Web) result(n int) (webResult, bool) {
 func (w *Web) SearchTool() *Tool {
 	return &Tool{
 		Name: "web_search",
-		Description: "Search the web for something current or outside your knowledge: news, prices, " +
-			"scores, anything after your training. Answers 'ابحث في النت', 'وش صار في', 'what is " +
-			"the price of', 'who won'. Use it only when the answer really depends on the outside " +
-			"world. For a price or a product in Saudi Arabia, an English query with the country " +
-			"in it finds shops and price comparisons that an Arabic one misses.",
+		Description: "Free web search for anything current, post-training, or unfamiliar: apps, software, " +
+			"tools, websites, products, brands, games, people, news, prices, scores, or any name " +
+			"you are not 100% sure about (including English names phonetically transcribed in Arabic). " +
+			"Always search with the inferred English name for tech/apps/brands, and include 'Saudi Arabia' " +
+			"or 'SAR' for Saudi prices/products.",
 		Params: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
