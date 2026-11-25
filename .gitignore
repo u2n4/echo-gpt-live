@@ -7,10 +7,12 @@ secrets/
 bin/
 dist/
 *.exe
+__pycache__/
+*.pyc
+# local agent review scratch
+docs/review-out/
 # logs & captures
 logs/
-traces/
-.tmp/
 *.pcap
 *.pcapng
 runs/

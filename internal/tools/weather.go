@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,10 +51,19 @@ func wmo(code int) string {
 }
 
 // Weather reports the current conditions at one fixed place.
+// Results are cached for 10 minutes per Weather instance so Ambient calls cost <1 ms
+// instead of ~500 ms on every delegation.
 func Weather(lat, lon float64, tz string, client *http.Client) *Tool {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
+	var (
+		cacheMu    sync.Mutex
+		cachedText string
+		cachedURL  string
+		cachedAt   time.Time
+	)
+	const weatherCacheTTL = 10 * time.Minute
 	return &Tool{
 		Name: "weather_now",
 		Description: "Current weather, yesterday's weather/rain, and the 7-day daily forecast where he lives " +
@@ -68,6 +78,13 @@ func Weather(lat, lon float64, tz string, client *http.Client) *Tool {
 				"&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,weather_code"+
 				"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,weather_code&forecast_days=7&past_days=1",
 				weatherBase, lat, lon, url.QueryEscape(tz))
+			cacheMu.Lock()
+			if cachedText != "" && cachedURL == u && time.Since(cachedAt) < weatherCacheTTL {
+				s := cachedText
+				cacheMu.Unlock()
+				return s, nil
+			}
+			cacheMu.Unlock()
 			body, err := get(ctx, client, u, 64<<10, nil)
 			if err != nil {
 				return "", fmt.Errorf("the weather service did not answer: %w", err)
@@ -133,6 +150,11 @@ func Weather(lat, lon float64, tz string, client *http.Client) *Tool {
 					s += " Daily (yesterday + 7d): " + strings.Join(parts, "; ") + "."
 				}
 			}
+			cacheMu.Lock()
+			cachedText = s
+			cachedURL = u
+			cachedAt = time.Now()
+			cacheMu.Unlock()
 			return s, nil
 		},
 	}

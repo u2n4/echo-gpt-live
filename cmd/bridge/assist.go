@@ -89,13 +89,12 @@ func (w *transcriptWindow) add(text string) {
 func (w *transcriptWindow) question() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// The first question of a call reaches back only as far as a question can be long. The whole
-	// window reached back to his greeting, which the first delegation then answered as if it were
-	// part of the question. Grok found it.
+	// Bound EVERY question to the recent firstQuestionReach window (15 s) so background TV
+	// dialogue transcribed 20-45 s ago never piles onto the user's current command.
 	cut := time.Now().Add(-firstQuestionReach)
 	var b strings.Builder
 	for _, p := range w.buf {
-		if p.ord <= w.taken || (w.taken == 0 && p.at.Before(cut)) {
+		if p.ord <= w.taken || p.at.Before(cut) {
 			continue
 		}
 		b.WriteString(p.text)
@@ -205,11 +204,13 @@ type assistant struct {
 	// It reports whether the goodbye was new: a phrase match may have heard, and answered, the
 	// same words already.
 	hangUp func(at time.Time) bool
+	// skip reports a question the TV remote already acted on (remote.go handles). Such a
+	// delegation is answered silently: the router would only say it cannot control a TV.
+	skip func(question string) bool
 
 	// confirmMu guards confirmTimer only; the permission itself lives in pendingWrite.
-	confirmMu         sync.Mutex
-	confirmTimer      *time.Timer
-	confirmGeneration uint64
+	confirmMu    sync.Mutex
+	confirmTimer *time.Timer
 }
 
 // confirmQuiet is how long a heard yes waits for the rest of its utterance. The transcript
@@ -295,6 +296,12 @@ func (a *assistant) refresher() func() {
 	return a.refresh
 }
 
+func (a *assistant) refreshContext() {
+	if fn := a.refresher(); fn != nil {
+		fn()
+	}
+}
+
 // current returns the live call's context and id. A zero id means there is no call, and a
 // delegation that arrives then has nothing to answer into.
 func (a *assistant) current() (context.Context, string) {
@@ -356,7 +363,6 @@ func (a *assistant) act(ctx context.Context, call string, said heard) {
 func (a *assistant) stopConfirm() {
 	a.confirmMu.Lock()
 	defer a.confirmMu.Unlock()
-	a.confirmGeneration++
 	if a.confirmTimer != nil {
 		a.confirmTimer.Stop()
 		a.confirmTimer = nil
@@ -373,27 +379,17 @@ func (a *assistant) deferConfirm(ctx context.Context, call string, at time.Time)
 	if a.confirmTimer != nil {
 		a.confirmTimer.Stop()
 	}
-	a.confirmGeneration++
-	generation := a.confirmGeneration
 	a.confirmTimer = time.AfterFunc(confirmQuiet, func() {
-		a.finishConfirm(generation, ctx, call, at)
-	})
-}
-
-func (a *assistant) finishConfirm(generation uint64, ctx context.Context, call string, at time.Time) {
-	a.confirmMu.Lock()
-	if generation != a.confirmGeneration {
+		a.confirmMu.Lock()
+		a.confirmTimer = nil
 		a.confirmMu.Unlock()
-		return
-	}
-	a.confirmTimer = nil
-	a.confirmMu.Unlock()
-	if ctx.Err() != nil {
-		return
-	}
-	if said := listen(a.window.since(at)); said != heardNothing {
-		a.act(ctx, call, said)
-	}
+		if ctx.Err() != nil {
+			return // the call ended inside the window
+		}
+		if said := listen(a.window.since(at)); said != heardNothing {
+			a.act(ctx, call, said)
+		}
+	})
 }
 
 // settle runs, or declines to run, the one write he was asked about, and says what happened.
@@ -407,12 +403,10 @@ func (a *assistant) settle(ctx context.Context, sp speaker, deleg, tool, args st
 	out, err := a.answerer.RunTool(ctx, tool, args)
 	if err != nil {
 		a.ev("delegation_write_failed", "tool", tool, "err", err.Error())
-		out = spokenFailed
-	} else if tool == "remember" {
-		// What she knows about him changed a second ago; the next question should know it too.
-		if refresh := a.refresher(); refresh != nil {
-			refresh()
-		}
+		out = spokenFailed + err.Error()
+	} else if tool == "remember" || tool == "forget_memory" {
+		// What she knows about the household changed a second ago; the next question should know it too.
+		a.refreshContext()
 	}
 	a.say(ctx, sp, deleg, out)
 }
@@ -484,6 +478,14 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 		return
 	}
 
+	if a.skip != nil && a.skip(question) {
+		a.ev("delegation_tv_handled", "id", delegationID, "note", "the remote already pressed it; answered silently")
+		if err := sb.Thinking(ctx, delegationID, spokenTVHandled); err != nil {
+			a.ev("delegation_send_failed", "err", err.Error())
+		}
+		return
+	}
+
 	a.ev("delegation_start", "id", delegationID, "chars", len(question))
 	t0 := time.Now()
 
@@ -501,9 +503,6 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 	ask.PrevQ, ask.PrevA = a.previous()
 
 	answer, err := a.answerer.Answer(ctx, ask)
-	if ctx.Err() != nil {
-		return // an ended call cannot arm permission or a goodbye in its successor
-	}
 	if err != nil {
 		var ending *tools.ErrCallEnding
 		if errors.As(err, &ending) {
@@ -590,13 +589,15 @@ func truncateFor(s string, n int) string {
 // What she says on the paths the router cannot phrase itself. Gulf Arabic, because that is the
 // room: these used to be English, and the voice model spoke them in English to him.
 const (
-	spokenNoQuestion    = "ما سمعت السؤال زين، عيده لو سمحت."
-	spokenAskPermission = "أقدر أسويها. قل نعم وبسويها: "
+	spokenNoQuestion = "ما سمعت السؤال زين، ممكن تعيدينه لو سمحتي."
+	// Known, not spoken: the remote already pressed what was asked for.
+	spokenTVHandled     = "أمر التلفزيون تنفّذ من البيت مباشرة. لا تقولي شي، اسكتي وانتظري الكلام الجاي."
+	spokenAskPermission = "تأكيد بس، قولي نعم وبسويها: "
 	spokenCouldNotFind  = "ما قدرت أعرف الجواب."
 	spokenDeclined      = "تمام، ما بسويها."
 	spokenFailed        = "ما زبطت: "
 	spokenSupersedes    = "خلاص نسينا الطلب الأول. "
-	spokenGoodbye       = "مع السلامة."
+	spokenGoodbye       = "مع السلامة، في أمان الله."
 	spokenLooking       = "ثواني، أشوف لك."
 	spokenHello         = "هلا."
 )

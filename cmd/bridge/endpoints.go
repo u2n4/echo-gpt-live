@@ -1,7 +1,6 @@
 package main
 
 import (
-	"net/url"
 	"strings"
 
 	"github.com/u2n4/echo-gpt-live/internal/tools"
@@ -18,18 +17,17 @@ func parseEndpoints(s string) []tools.Endpoint {
 		if part == "" {
 			continue
 		}
-		name, address, ok := strings.Cut(part, "=")
-		name, address = strings.TrimSpace(name), strings.TrimSpace(address)
-		if !ok || name == "" || address == "" {
+		name, url, ok := strings.Cut(part, "=")
+		name, url = strings.TrimSpace(name), strings.TrimSpace(url)
+		if !ok || name == "" || url == "" {
 			continue
 		}
-		u, err := url.Parse(address)
-		if err != nil || u.Hostname() == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			continue
 		}
 		out = append(out, tools.Endpoint{
 			Name: name,
-			URL:  u.String(),
+			URL:  url,
 			Says: tools.JSONField("summary", "%v"),
 		})
 	}

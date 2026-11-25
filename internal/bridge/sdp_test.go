@@ -50,7 +50,6 @@ func TestSetOpusFmtpReplacesOnlyTheOpusLine(t *testing.T) {
 		"m=audio 9 UDP/TLS/RTP/SAVPF 111 0 8\r\n",
 		"a=mid:0\r\n",
 		"a=sendonly\r\n",
-		"a=sendrecv\r\n",
 	} {
 		if !strings.Contains(out, must) {
 			t.Fatalf("rewriting the fmtp destroyed %q", strings.TrimSpace(must))

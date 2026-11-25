@@ -19,7 +19,6 @@ package bridge
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -74,7 +73,8 @@ type LiveLeg struct {
 	endedAt         atomic.Int64 // unix nanos when Close ran; Age freezes there
 	firstIn         atomic.Int64 // ms after dial
 	lastVoice       atomic.Int64 // unix nanos of the last packet that carried speech, not silence
-	senderReport    atomic.Pointer[liveSenderReport]
+	srPackets       atomic.Int64 // OpenAI's sender report: packets it says it has sent
+	srAt            atomic.Int64 // unix nanos of that report
 	started         time.Time
 	closeOnce       sync.Once
 
@@ -509,7 +509,22 @@ func DialLive(
 		"has_m_application", strings.Contains(offerSDP, "m=application"), "bytes", len(offerSDP))
 
 	l.started = time.Now()
-	sess, forked, err := createLiveSession(ctx, client, forkFrom, offerSDP, sessCfg, ev)
+	var sess *openai.LiveSession
+	forked := false
+	if forkFrom != "" {
+		sess, err = client.Fork(ctx, forkFrom, offerSDP)
+		if err != nil {
+			// A fork can fail because the stored session expired; a fresh session is still
+			// better than no assistant, so fall back and say so.
+			ev("live_fork_failed", "source", forkFrom, "err", err.Error(), "action", "creating a fresh session")
+			sess, err = client.CreateSession(ctx, offerSDP, sessCfg)
+		} else {
+			forked = true
+			ev("live_forked", "from", forkFrom, "to", sess.ID)
+		}
+	} else {
+		sess, err = client.CreateSession(ctx, offerSDP, sessCfg)
+	}
 	if err != nil {
 		_ = pc.Close()
 		return nil, err
@@ -667,25 +682,6 @@ func DialLive(
 	return l, nil
 }
 
-// Keep session creation separate from transport setup so the paid fallback path
-// can be exercised without opening a PeerConnection or any live service.
-func createLiveSession(ctx context.Context, client *openai.LiveClient, forkFrom, offerSDP string, cfg openai.LiveSessionConfig, ev Events) (*openai.LiveSession, bool, error) {
-	if forkFrom != "" {
-		sess, err := client.Fork(ctx, forkFrom, offerSDP)
-		if err == nil {
-			ev("live_forked", "from", forkFrom, "to", sess.ID)
-			return sess, true, nil
-		}
-		if errors.Is(err, openai.ErrSessionCreated) {
-			return nil, false, err // already billed: never create a second session
-		}
-		// An expired source can still fall back when no paid session was recovered.
-		ev("live_fork_failed", "source", forkFrom, "err", err.Error(), "action", "creating a fresh session")
-	}
-	sess, err := client.CreateSession(ctx, offerSDP, cfg)
-	return sess, false, err
-}
-
 func (l *LiveLeg) readInbound(tr *webrtc.TrackRemote) {
 	// Every packet read here is forwarded to the Echo immediately, so OpenAI's delivery rhythm
 	// becomes the Echo's playout problem. Measure it.
@@ -804,7 +800,8 @@ func (l *LiveLeg) drainRTCP(rc *webrtc.RTPReceiver, ev Events) {
 				// RTP packet arrived in a hundred seconds while the transcript said she was
 				// answering the whole time; whether her audio was never sent or sent and lost on
 				// the way is exactly what this number settles, and it was not being kept.
-				l.senderReport.Store(&liveSenderReport{packets: int64(v.PacketCount), at: time.Now()})
+				l.srPackets.Store(int64(v.PacketCount))
+				l.srAt.Store(time.Now().UnixNano())
 			}
 		}
 	}
@@ -833,26 +830,25 @@ func (l *LiveLeg) BelowTheReader() (packets uint64, lastAgo time.Duration) {
 // SenderReport returns OpenAI's latest claim of how many RTP packets it has sent, and when it
 // said so. Zero and the zero time if it has not reported yet.
 func (l *LiveLeg) SenderReport() (packets int64, at time.Time) {
-	report := l.senderReport.Load()
-	if report == nil {
+	ns := l.srAt.Load()
+	if ns == 0 {
 		return 0, time.Time{}
 	}
-	return report.packets, report.at
-}
-
-type liveSenderReport struct {
-	packets int64
-	at      time.Time
+	return l.srPackets.Load(), time.Unix(0, ns)
 }
 
 func eventType(b []byte) string {
-	var event struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(b, &event) != nil || len(event.Type) > 128 {
+	// A tiny scan instead of a full unmarshal: this runs on every data-channel message.
+	const key = `"type":"`
+	i := strings.Index(string(b), key)
+	if i < 0 {
 		return ""
 	}
-	return event.Type
+	rest := string(b)[i+len(key):]
+	if j := strings.IndexByte(rest, '"'); j > 0 {
+		return rest[:j]
+	}
+	return ""
 }
 
 func summarizeLiveAnswer(ev Events, sdp string) {

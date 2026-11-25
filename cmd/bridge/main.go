@@ -42,6 +42,7 @@ import (
 	"github.com/u2n4/echo-gpt-live/internal/memory"
 	"github.com/u2n4/echo-gpt-live/internal/openai"
 	"github.com/u2n4/echo-gpt-live/internal/tools"
+	"github.com/u2n4/echo-gpt-live/internal/tv"
 )
 
 type app struct {
@@ -68,11 +69,14 @@ type app struct {
 	kickSidebandAfter time.Duration
 	assist            *assistant
 	farewell          *bridge.Farewell
+	remote            *remote // the TV remote by voice (remote.go); nil without --tv-url
+	timers            *tools.TimerManager
 	byeGrace          time.Duration
 	idleFor           time.Duration
 	holdFor           time.Duration
 	maxSess           time.Duration
 	instr             string
+	household         string
 	logText           bool
 	mem               *memory.Profile
 	place             string
@@ -80,11 +84,9 @@ type app struct {
 
 	// offerMu admits one offer at a time. Two copies of the same directive arriving together used
 	// to both pass the repeat check before either had published its session, and both built one.
-	offerMu         sync.Mutex
-	callMu          sync.Mutex      // serialize attaching resources with closeLeg's cleanup
-	resourceSession *bridge.Session // protected by callMu; late cleanup cannot touch a newer call
-	closing         atomic.Bool     // set at shutdown; an offer that arrives after it is refused
-	dials           sync.WaitGroup  // dials in flight, so shutdown can wait for them to close what they built
+	offerMu sync.Mutex
+	closing atomic.Bool    // set at shutdown; an offer that arrives after it is refused
+	dials   sync.WaitGroup // dials in flight, so shutdown can wait for them to close what they built
 
 	mu       sync.Mutex
 	sess     *bridge.Session
@@ -95,7 +97,6 @@ type app struct {
 	// The offer that made the current session and the answer it got, so a redelivery of the same
 	// directive gets the same answer instead of a fresh start.
 	lastOffer, lastAnswer string
-	seenOffers            map[string]time.Time // retired directives must not start paid calls again
 
 	reflecting atomic.Bool // one after-the-call memory pass at a time
 }
@@ -134,9 +135,6 @@ func (a *app) Offer(id, offer string) (string, error) {
 		return answer, nil
 	}
 	a.mu.Unlock()
-	if err := a.admitOffer(id); err != nil {
-		return "", err
-	}
 
 	a.teardown("replaced_by_new_offer")
 
@@ -161,18 +159,18 @@ func (a *app) Offer(id, offer string) (string, error) {
 	// swallows a failed POST - the OpenAI side used to keep billing until the idle timer noticed
 	// nobody was talking. The transport itself is the earlier signal.
 	s.SetOnDown(func(reason string) {
-		if !a.retireSession(s) {
+		a.mu.Lock()
+		cur := a.sess
+		a.mu.Unlock()
+		if cur != s {
 			return
 		}
-		a.ev("echo_transport_down", "reason", reason, "note", "invalidating the call and hanging up OpenAI")
-		s.SetAudioSink(nil)
-		a.closeLegFor(s, reason)
-		s.Close(reason)
+		a.ev("echo_transport_down", "reason", reason, "note", "hanging up OpenAI; the Echo session is left for Alexa's directive or the watchdog")
+		a.closeLeg(reason)
 	})
 
 	a.mu.Lock()
 	a.sess = s
-	a.seenOffers[id] = time.Now()
 	a.lastOffer, a.lastAnswer = offer, answer
 	forkFrom := a.lastLive
 	if a.sessCfg.Store != nil && !*a.sessCfg.Store {
@@ -191,23 +189,6 @@ func (a *app) Offer(id, offer string) (string, error) {
 // startup. This is a capacity, not an added delay: release as soon as Live is ready.
 const holdPackets = 1000
 
-// Greeting playback outlives attachLive's dial context, but is bounded to eight seconds.
-func startGreeting(connected <-chan struct{}, play func(context.Context)) chan struct{} {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer cancel()
-		select {
-		case <-connected:
-		case <-ctx.Done():
-			return
-		}
-		play(ctx)
-	}()
-	return done
-}
-
 // attachLive dials GPT-Live and connects the two media legs.
 func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	defer a.dials.Done()
@@ -222,9 +203,14 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	// process that has been up since Tuesday would otherwise tell him it is Tuesday.
 	sessCfg := a.sessCfg
 	sessCfg.Instructions = a.instr + " " + a.greetingPolicy() + " " + a.whereAndWhen()
+	if caps := a.capabilitiesSummary(); caps != "" {
+		sessCfg.Instructions += " " + caps
+	}
+	if a.remote != nil {
+		sessCfg.Instructions += " " + tvPolicy()
+	}
 	if m := a.mem.Text(); m != "" {
-		// Reading memory costs nothing and happens before he speaks. This is the whole reason the
-		// profile is a few hundred tokens of text and not a database being searched mid-question.
+		// Reading memory costs nothing and happens before anyone speaks.
 		sessCfg.Instructions += "\n\n" + m
 	}
 
@@ -243,14 +229,27 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	if a.greeting == "" {
 		close(greetDone)
 	} else {
-		greetDone = startGreeting(s.Connected(), func(ctx context.Context) {
-			n, err := bridge.PlayGreeting(ctx, a.greeting, s.WriteAudio, splice)
+		// On its own clock, not this function's. The dial below can return before the Echo's
+		// transport is up, and this function's context ends with it; the greeting then stopped
+		// at packet 31 of 41 on the first real call, or never started. A greeting that outlives
+		// a dead session only fails its next write, which is fine; one cut short is heard.
+		gctx, gcancel := context.WithTimeout(context.Background(), greetingWait)
+		go func() {
+			defer close(greetDone)
+			defer gcancel()
+			select {
+			case <-s.Connected():
+			case <-gctx.Done():
+				a.ev("greeting_skipped", "reason", "the Echo did not connect in time")
+				return
+			}
+			n, err := bridge.PlayGreeting(gctx, a.greeting, s.WriteAudio, splice)
 			if err != nil {
 				a.ev("greeting_failed", "packets", n, "err", err.Error())
 				return
 			}
 			a.ev("greeting_played", "packets", n, "echo_session_age_s", s.Age().Seconds())
-		})
+		}()
 	}
 
 	leg, err := bridge.DialLive(ctx, a.live, sessCfg, a.liveCfg, forkFrom, a.ev)
@@ -263,8 +262,6 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 		return
 	}
 
-	a.callMu.Lock()
-	defer a.callMu.Unlock()
 	a.mu.Lock()
 	if a.sess != s { // a newer invocation arrived, or Alexa hung up, while we were dialling
 		a.mu.Unlock()
@@ -273,7 +270,6 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 		hold.Drop()
 		return
 	}
-	a.resourceSession = s
 	a.leg = leg
 	a.lastLive = leg.SessionID
 	// When the assistant goes, the call goes. Idle used to hang up OpenAI and leave the Echo
@@ -283,7 +279,7 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	// only way to find out whether Alexa hangs up when the transport goes (F-UNK-3).
 	gate := openai.NewIdleGate(a.idleFor, func(idle time.Duration) {
 		a.ev("idle_close", "idle_s", idle.Seconds(), "note", "no one has spoken for this long; ending the call")
-		a.teardownFor(s, "idle")
+		a.teardown("idle")
 	})
 	a.gate = gate
 	a.mu.Unlock()
@@ -295,7 +291,7 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 			return // closed by the bridge itself, which is already cleaning up
 		}
 		a.ev("live_leg_ended_on_its_own", "reason", reason, "note", "ending the call around it")
-		a.teardownFor(s, reason)
+		a.teardown(reason)
 	})
 
 	// The idle timer used to be fed by RTP arrival, which made it useless: the Echo streams its
@@ -332,10 +328,59 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	// said "speaking" for the entire call, so his withdrawal of a goodbye was always taken for her
 	// echo and the goodbye's grace never saw a quiet moment. A gap inside one sentence is far
 	// shorter than 1200 ms; a real pause after she finishes is longer.
-	farewell.SetSpeaking(func() bool {
+	speaking := func() bool {
 		last := leg.LastVoice()
 		return !last.IsZero() && time.Since(last) < 1200*time.Millisecond
-	})
+	}
+	farewell.SetSpeaking(speaking)
+	// The TV remote reads the same transcript with the same echo judge: her voice saying "يمين"
+	// back through the microphone is not his command.
+	// The remote's echo window is wider than the farewell's: her words reach the transcript after
+	// her audio does, and a key pressed by her echo is worse than a command he has to repeat
+	// (Grok). In remote mode she is told to stay quiet anyway.
+	remoteSpeaking := func() bool {
+		last := leg.LastVoice()
+		return !last.IsZero() && time.Since(last) < 650*time.Millisecond
+	}
+	// remoteTok is this call's token: a transcript callback of this call that runs late, after
+	// the next call began, is refused instead of pressing keys in the new one. Begin runs under
+	// a.mu and only while this leg is still the current one: closeLeg clears a.leg under the same
+	// lock before it calls End, so a teardown that raced this setup cannot be undone by a late
+	// Begin, and a stale setup cannot reset a newer call's token (Codex). Lock order: a.mu, then
+	// the remote's own lock; the remote never takes a.mu.
+	remoteSay := func(line string) {
+		if sb := leg.Sideband(); sb != nil {
+			go func() {
+				sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := sb.Commentary(sctx, "", line); err != nil {
+					a.ev("remote_say_failed", "err", err.Error())
+				}
+			}()
+		}
+	}
+	var remoteTok uint64
+	a.mu.Lock()
+	if a.leg == leg {
+		remoteTok = a.remote.Begin(remoteSpeaking, remoteSay)
+	}
+	a.mu.Unlock()
+	if a.timers != nil {
+		a.timers.SetOnRing(func(label string) {
+			if sb := leg.Sideband(); sb != nil {
+				go func() {
+					tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					msg := fmt.Sprintf("انتهى مؤقت %s الآن!", label)
+					if err := sb.Commentary(tctx, "", msg); err != nil {
+						a.ev("timer_ring_failed", "label", label, "err", err.Error())
+					} else {
+						a.ev("timer_ring_sent", "label", label)
+					}
+				}()
+			}
+		})
+	}
 	assist := a.assist
 	if assist != nil {
 		// A new call is a new conversation AND a new set of permissions. It also gets its own
@@ -449,6 +494,8 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 		if assist != nil {
 			assist.onTranscript(text)
 		}
+		// Non-blocking: it only appends and restarts a timer; the TV is driven off this goroutine.
+		a.remote.Feed(remoteTok, text)
 		if farewell != nil && farewell.Feed(text) {
 			// The bridge says her goodbye on this path too, so the voice model never has to, and
 			// so a goodbye heard by phrase and understood by the router a second later is
@@ -561,6 +608,27 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	a.ev("bridge_live", "openai_session", leg.SessionID, "forked_from", forkFrom,
 		"echo_session_age_s", s.Age().Seconds())
 
+	// Her hello, said through OpenAI's own stream the moment the session is up. The model was
+	// told to say it and on the 17:24 call it never did: first voice at 7 s, only after he spoke.
+	// The bridge-played clip says it at 2 s but both calls that used it (15:15, 18:24) lost the
+	// Echo's microphone: Amazon's media server stopped sending after 8-20 packets, at the moment
+	// our audio reached it, and every call whose first outbound audio came later (4 s) worked.
+	// So until that is understood the clip stays off, and this is the hello: about 3.5-4 s
+	// after the offer, through the same path everything else she says takes.
+	if a.greeting == "" {
+		if sb := leg.Sideband(); sb != nil {
+			go func() {
+				hctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := sb.Commentary(hctx, "", spokenHello); err != nil {
+					a.ev("hello_failed", "err", err.Error())
+					return
+				}
+				a.ev("hello_sent", "echo_session_age_s", s.Age().Seconds())
+			}()
+		}
+	}
+
 	if a.kickSidebandAfter > 0 {
 		// Test hook only. A stalled socket cannot be ordered from OpenAI, but the path that
 		// recovers from one - Read returns, a fresh attach to the same session, events resume -
@@ -574,18 +642,18 @@ func (a *app) attachLive(s *bridge.Session, forkFrom string) {
 	}
 }
 
-// closeLegFor closes resources belonging to owner; nil means unconditional cleanup.
-func (a *app) closeLegFor(owner *bridge.Session, reason string) {
-	a.callMu.Lock()
-	defer a.callMu.Unlock()
-	if owner != nil && a.resourceSession != owner {
-		return
-	}
-	s := a.resourceSession
-	a.resourceSession = nil
+// closeLeg hangs up only the OpenAI side, stopping the per-minute clock while the Echo session
+// stays connected and keeps its video flowing.
+func (a *app) closeLeg(reason string) {
 	a.mu.Lock()
 	leg, gate := a.leg, a.gate
 	a.leg, a.gate = nil, nil
+	s := a.sess
+	// Before the hangup, which can take seconds: nothing he said in this call may still press a
+	// key after it, and a press in flight is cancelled. In the SAME critical section that clears
+	// a.leg, so a replacement call's Begin (which also runs under a.mu, after it sees its own leg
+	// installed) can never be undone by this older End (Codex). Order: a.mu, then the remote's lock.
+	a.remote.End()
 	a.mu.Unlock()
 	if s != nil {
 		s.SetAudioSink(nil)
@@ -610,14 +678,13 @@ func (a *app) closeLegFor(owner *bridge.Session, reason string) {
 	// Nothing started for this call should outlive it. A delegation still running would be talking
 	// into a closed socket, and a write it had already been given permission for would land after
 	// the person who granted it had hung up.
+	if a.timers != nil {
+		a.timers.CancelAll()
+	}
 	if a.assist != nil {
-		// Learn from the call that just ended — AFTER the hangup above, never before it. The whole
-		// design of memory here rests on this line being on this side of leg.Close: he is not
-		// waiting for it, it is not billed, and if it fails the only cost is that one conversation
-		// taught it nothing. The transcript is TAKEN, not read: a call closed on idle and again on
-		// teardown was being reflected on twice, and paid for twice. Codex found it.
+		// Learn from the call that just ended — AFTER the hangup above, never before it.
 		if leg != nil {
-			if said := a.assist.window.TakeWhole(); a.mem != nil && len(said) > 40 {
+			if said := a.assist.window.TakeWhole(); a.mem != nil && len([]rune(said)) > 12 {
 				go a.reflect(said)
 			}
 		}
@@ -631,35 +698,6 @@ func (a *app) closeLegFor(owner *bridge.Session, reason string) {
 	bridge.FlushWriteMeters()
 }
 
-// retireSession invalidates an in-flight dial before resource cleanup can block.
-func (a *app) retireSession(s *bridge.Session) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.sess != s {
-		return false
-	}
-	a.sess = nil
-	return true
-}
-
-// admitOffer is called after the current-call repeat check, with offerMu held.
-func (a *app) admitOffer(id string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.seenOffers == nil {
-		a.seenOffers = make(map[string]time.Time)
-	}
-	for key, at := range a.seenOffers {
-		if time.Since(at) > 5*time.Minute {
-			delete(a.seenOffers, key)
-		}
-	}
-	if _, seen := a.seenOffers[id]; seen {
-		return errors.New("this offer belongs to an ended or changed session")
-	}
-	return nil
-}
-
 // whereAndWhen tells the assistant where the Echo is and what time it is there.
 //
 // Without it the model asks him which city he is in before it can answer about the weather, and it
@@ -671,21 +709,74 @@ func (a *app) admitOffer(id string) error {
 func (a *app) whereAndWhen() string {
 	now := time.Now().In(a.tz)
 	days := [...]string{"الأحد", "الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"}
-	when := fmt.Sprintf("الوقت عنده الآن %s، و%s %s.", now.Format("15:04"), days[int(now.Weekday())], now.Format("2006-01-02"))
-	if a.place == "" {
-		return when + " لا تسأله عن الوقت، تعرفه."
+	when := fmt.Sprintf("الوقت المحلي الآن %s، اليوم %s %s.", now.Format("15:04"), days[int(now.Weekday())], now.Format("2006-01-02"))
+	var parts []string
+	if a.place != "" {
+		parts = append(parts, fmt.Sprintf("البيت في %s.", a.place))
 	}
-	return fmt.Sprintf("هو في %s. %s لا تسأله عن موقعه ولا عن مدينته ولا عن الوقت، تعرفهم.", a.place, when)
+	parts = append(parts, when+" لا تسألي عن الموقع ولا عن المدينة ولا عن الوقت، تعرفينهم.")
+	if a.household != "" {
+		parts = append(parts, a.household)
+	}
+	return strings.Join(parts, " ")
 }
 
-// greetingPolicy tells the model who says hello. With --greeting the bridge has already said it
-// by the time the session starts, and a second hello on top of his first sentence is exactly the
-// talking-over that the one-word rule existed to avoid.
-func (a *app) greetingPolicy() string {
-	if a.greeting != "" {
-		return "الخط قال له \"هلا\" قبل ما تبدأ، فلا تسلّم ولا تعيدها؛ ابدأ بالاستماع، وإذا كان يتكلم أصلاً جاوبه على طول."
+func (a *app) capabilitiesSummary() string {
+	var caps []string
+	if a.assist != nil && a.assist.answerer != nil && a.assist.answerer.Tools != nil {
+		has := map[string]bool{}
+		for _, n := range a.assist.answerer.Tools.Names() {
+			has[n] = true
+		}
+		if has["prayer_times"] {
+			caps = append(caps, "مواقيت الصلاة الدقيقة والتاريخ الهجري")
+		}
+		if has["weather_now"] {
+			caps = append(caps, "الطقس وتوقعات الأسبوع")
+		}
+		if has["shopping_list"] {
+			caps = append(caps, "قائمة المقاضي (إضافة، قراءة، شطب، ومسح)")
+		}
+		if has["reminders"] {
+			caps = append(caps, "حفظ التذكيرات والمواعيد ومواعيد الأدوية اليومية")
+		}
+		if has["kitchen_timer"] {
+			caps = append(caps, "مؤقت الطبخ داخل المكالمة")
+		}
+		if has["quran_lookup"] {
+			caps = append(caps, "آيات القرآن الكريم والتفسير الميسّر والأذكار والأدعية")
+		}
+		if has["convert"] {
+			caps = append(caps, "تحويل مقادير الطبخ وحرارة الفرن والعملات")
+		}
+		if has["remember"] && has["recall_memory"] {
+			caps = append(caps, "ذاكرة عائلية قوية تحفظ الأسماء والأقارب وأماكن الأشياء والتفضيلات وتسترجعها")
+		}
+		if has["web_search"] || a.assist.answerer.WebSearch {
+			caps = append(caps, "البحث الحي في الإنترنت للأخبار والأسعار والمعلومات")
+		}
 	}
-	return "أول ما تبدأ المكالمة قل \"هلا\" بكلمة وحدة عشان يعرف إنك تسمعه، بدون سلام طويل."
+	if a.remote != nil {
+		caps = append(caps, "تحكم كامل وفوري بالتلفزيون (شاشة هواوي + الشاومي بوكس): تشغيل وإطفاء، تحويل مداخل HDMI بين الكاميرات والشاومي بملء الشاشة، صوت وميوت وتوقيف، تنقل صامت وسريع بالريموت (فوق/تحت/يمين/يسار/اضغط/رجوع/الرئيسية)، رؤية الشاشة، معرفة وين وصلنا في المسلسلات، والبحث والكتابة والتشغيل في نتفلكس ويوتيوب وشاهد")
+	}
+	if len(caps) == 0 {
+		return ""
+	}
+	return "قدراتك الحقيقية المتوفرة الآن (إذا سُئلتِ وش تقدرين تسوين، جاوبي بوضوح واختصار من هالقائمة فقط بدون اختراع): " + strings.Join(caps, "، ") + ". " +
+		"حدودك بصدق: مؤقت الطبخ يرن أثناء فتح المكالمة فقط؛ أما للمنبه بعد إغلاق المكالمة فقولي بلطف: «للمنبه بعد ما نسكر، قولي لأليكسا مباشرة: Alexa set a timer»."
+}
+
+// greetingPolicy tells the model who says hello.
+func (a *app) greetingPolicy() string {
+	return "الخط قال «هلا» أول ما بدأت المكالمة، فلا تسلّمي ولا تعيديها؛ ابدئي بالاستماع، وإذا كان المتحدث يتكلم أصلاً جاوبيه على طول."
+}
+
+func envInt(key string, def int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil {
+		return def
+	}
+	return v
 }
 
 // envOr reads a setting from the environment so the service file can carry what is personal
@@ -852,23 +943,17 @@ func (a *app) liveAge() time.Duration {
 	return leg.Age()
 }
 
-func (a *app) teardown(reason string) { a.teardownFor(nil, reason) }
-
-func (a *app) teardownFor(expected *bridge.Session, reason string) {
+func (a *app) teardown(reason string) {
 	// The session leaves the app FIRST. A dial that returns while the rest of this runs then finds
 	// it gone and closes what it built, instead of installing a leg into a call that is ending.
 	a.mu.Lock()
-	if expected != nil && a.sess != expected {
-		a.mu.Unlock()
-		return
-	}
 	s := a.sess
 	a.sess = nil
 	a.mu.Unlock()
 	if s != nil {
 		s.SetAudioSink(nil)
 	}
-	a.closeLegFor(s, reason)
+	a.closeLeg(reason)
 	if s != nil {
 		s.Close(reason)
 	}
@@ -881,7 +966,7 @@ func (a *app) watchdog(s *bridge.Session) {
 	a.mu.Unlock()
 	if cur == s {
 		a.ev("max_session_reached", "max", a.maxSess.String())
-		a.teardownFor(s, "max_session")
+		a.teardown("max_session")
 	}
 }
 
@@ -910,7 +995,7 @@ func (a *app) Disconnected(id string) {
 	// Close the OpenAI side at once so the clock stops; hold the Echo transport briefly to
 	// observe whether Amazon keeps sending after its own directive.
 	s.SetAudioSink(nil)
-	a.closeLegFor(s, "alexa_disconnected")
+	a.closeLeg("alexa_disconnected")
 	go func() {
 		if a.holdFor > 0 {
 			a.ev("hold_after_disconnect", "seconds", a.holdFor.Seconds())
@@ -948,21 +1033,24 @@ func main() {
 				"prayer times or what is nearby has an answer without a round trip. Default $BRIDGE_PLACE; "+
 				"empty leaves the location out of the prompt")
 		logText = flag.Bool("log-transcript", false, "write what he says into the run log. Off by default: it is his speech. Turn it on for one call when the assistant misbehaves and the timing alone cannot say why")
-		memFile = flag.String("memory-file", os.ExpandEnv("$HOME/.local/state/rtcdiag/memory.md"),
-			"where what it remembers about him is kept. Plain text he can read and correct; empty turns memory off")
-		lat = flag.Float64("lat", envFloat("BRIDGE_LAT"), "latitude of the house, for the weather tool. Default $BRIDGE_LAT; 0 with --lon 0 turns the weather tool off")
-		lon = flag.Float64("lon", envFloat("BRIDGE_LON"), "longitude of the house. Default $BRIDGE_LON")
-		tz  = flag.String("timezone", envOr("BRIDGE_TIMEZONE", "Local"), "the clock he lives on, an IANA zone name. Default $BRIDGE_TIMEZONE, else the host's zone; a name the host cannot resolve falls back to a fixed +03:00")
-		// Shaped after OpenAI's own GPT-Live prompting guide (fetched 2026-09-14): a personality, a
-		// listening policy, a delegation policy, and what to do at the ends of the call. The lines
-		// about not greeting twice and reusing a result that still answers are there because the
-		// 20:52 call of 2026-09-13 did both, and the one-word start is so he knows she can hear
-		// without a greeting long enough to talk over him.
-		instr = flag.String("instructions", "انت \"أسترا\"، مساعد صوتي ذكي في البيت عبر سماعة صوتية فقط (بدون شاشة ولا كيبورد ولا كاميرا). أسلوبك طبيعي وذكي وواضح زي شات جي بي تي الصوتي، هادي ومختصر بدون مبالغة ولا حشو. رد بالعربي الخليجي الطبيعي بثبات بدون خلط إنجليزي إلا للمصطلحات أو الأسماء، وإذا كلّمك بلغة ثانية رد بنفس لغته. جملة أو جملتين في العادة (أو أكثر شوي لو طلب شرح مفصّل). قل الأرقام والعملات كما ينطقها الناس. "+
-			"الاستماع: إذا قاطعك وانت تتكلم، اسكت فوراً واسمعه. إذا سكت عشان يفكر، انتظره ولا تعبّي السكوت. لا تعتبر السعال أو الضوضاء الخلفية طلباً، لكن إذا شخص في الغرفة كلّمك بصوت هادي أو من بعيد اسمعه وجاوبه طبيعي. وإذا صحّح لك كلمة أسأت سماعها (مثلاً قال «مطر مو مطار» أو كرّر الكلمة أو ترجمها للإنجليزي مثل rain)، اترك الموضوع الغلط القديم فوراً ولا تعاند ولا ترجع تذكره؛ افهم التصحيح وجاوب على المعنى الصحيح مباشرة. "+
-			"طلب المساعدة: إذا كان الجواب يعتمد على هذا الجهاز، أو على البيت، أو على ملاحظاته، أو على اليوم (الطقس، توقعات الأسبوع، أوقات الصلاة، أخبار، أسعار، نتائج مباريات)، أو سأل عن تطبيق أو برنامج أو موقع أو أداة أو منتج أو اسم جديد أو ما أنت متأكد منه 100% — اطلب المساعدة فوراً قبل ما تجاوب، ولا تخمّن النتيجة وانت تنتظر، ولا تقول «لحظة» ولا «ثواني»: الخط يقولها عنك، وانت اسكت لين يجيك الجواب. أما المعلومات العامة الأكيدة والحساب والترجمة والأفكار فجاوبها على طول بذكاء واختصار بدون طلب مساعدة. إذا جاك جواب من المساعدة وهو يكفي، استعمله ولا تطلب من جديد إلا إذا طلب هو تتأكد أو غيّر السؤال. "+
-			"الذكاء والطبيعية: عملتك الافتراضية دائماً الريال السعودي والسوق الافتراضي السعودية ولا تسأل دولار ولا ريال إلا إذا قال دولار صراحة. إذا السؤال ناقص تفصيل افترض الأكثر شيوعاً وجاوب مباشرة بدون استجواب. ممنوع تماماً تقول «اكتب لي» أو «أرسل صورة» أو «أرسل التهجئة» أو «وين شفته؟» أو «بأي جهاز؟» — هو يكلمك بصوته فقط وما عنده شاشة! وممنوع تختم بجمل آلية مثل «إذا عندك سؤال ثاني أقدر أساعدك». التأكيد فقط لحفظ أو حذف أو إرسال أو شراء. "+
-			"لا ترحّب مرة ثانية في نفس المكالمة ولا تعيد شي قلته. وإذا ما فهمت، قل ذلك بجملة وحدة قصيرة بدون اعتذار طويل ولا اختراع. إذا ودّعك أو طلب تقفل المكالمة، بأي كلمات كانت، لا تودّعه بنفسك: اطلب المساعدة على طول واسكت، والمساعدة هي اللي تودّعه وتقفل الخط.", "system instructions")
+		memFile       = flag.String("memory-file", os.ExpandEnv("$HOME/.local/state/rtcdiag/memory.md"), "where active household memory is kept (plain text; sibling memory_archive.jsonl holds the unlimited searchable archive). Empty turns memory off")
+		household     = flag.String("household", os.Getenv("BRIDGE_HOUSEHOLD"), "optional description of the household, how to address family members, and cultural/religious preferences. Default $BRIDGE_HOUSEHOLD")
+		prayerMethod  = flag.Int("prayer-method", envInt("BRIDGE_PRAYER_METHOD", 4), "Aladhan prayer calculation method (0 = Shia Ithna-Ashari / Ja'fari, 4 = Umm al-Qura). Default $BRIDGE_PRAYER_METHOD or 4")
+		shoppingFile  = flag.String("shopping-file", os.ExpandEnv("$HOME/.local/state/rtcdiag/shopping.md"), "where the household shopping list lives")
+		remindersFile = flag.String("reminders-file", os.ExpandEnv("$HOME/.local/state/rtcdiag/reminders.json"), "where household reminders and daily schedules live")
+		lat           = flag.Float64("lat", envFloat("BRIDGE_LAT"), "latitude of the house, for weather and prayer times. Default $BRIDGE_LAT; 0 with --lon 0 turns both off")
+		lon           = flag.Float64("lon", envFloat("BRIDGE_LON"), "longitude of the house. Default $BRIDGE_LON")
+		tz            = flag.String("timezone", envOr("BRIDGE_TIMEZONE", "Local"), "the clock the house lives on, an IANA zone name. Default $BRIDGE_TIMEZONE, else the host's zone; a name the host cannot resolve falls back to a fixed +03:00")
+		instr         = flag.String("instructions", "أنتِ «أسترا»، مساعد صوتي ذكي ودافئ في البيت شغّال على سماعة Amazon Echo Dot عبر سيرفر منزلي محلي؛ سمعية وصوتية فقط (بدون شاشة ولا كيبورد ولا كاميرا). "+
+			"أسلوبك محترم، هادي، حنون، وواضح باللهجة الخليجية الطبيعية المفهومة بدون مصطلحات تقنية ولا حشو. "+
+			"تمييز المتحدث بصمت تام: ابدئي دائماً بنبرة محايدة لطيفة (بدون «حبيبتي» وبدون افتراض أن المتحدث امرأة أو مناداة أي اسم عند الترحيب). استمعي بصمت لنبرة صوت المتحدث وتكيّفي بدقة بصيغة المذكر (أبشر/حاضر/تقدر) للصوت الرجالي، وبصيغة المؤنث (أبشري/حاضرة/تقدرين) للصوت النسائي، بدون ما تذكرين أبداً إنك تميّزين الصوت، وبدون ما تسألين «من معي؟»، وبدون تكرار الأسماء. وإذا كلّمك أحد بلغة ثانية (مثل الإنجليزي) ردي بنفس لغته بطلاقة بدون خلط صيغة المؤنث للرجال. جملة أو جملتين في العادة، وبسرعة كلام مريحة. قولي الأرقام والأوقات والعملات كما ينطقها الناس. "+
+			"القصائد والإبداع: إذا طلب منك أحد قصيدة أو أبيات شعر (مثل شعر حب أو مدح أو تهنئة)، قولي 2 إلى 4 أبيات شعرية جميلة مباشرة بدون مقدمات وبدون محاضرات أو نصائح! "+
+			"وصفات الطبخ: إذا طُلبت وصفة، قولي المقادير باختصار ثم خطوتين فقط كل مرة واسألي بلطف «جاهزة للي بعدها؟» بدل سرد طويل. "+
+			"التنفيذ المباشر بدون أسئلة مزعجة: في أوامر التلفزيون والأدوات لا تسألين كل شوي «سويت كذا، تبيني أسوي اللي بعده؟» — اطلبي المساعدة لتنفيذ الطلب كامل مرة وحدة. "+
+			"الاستماع: إذا قاطعك أحد وأنتِ تتكلمين اسكتي فوراً واسمعيه. إذا سكت ليفكّر انتظريه ولا تعبّي السكوت. لا تعتبرين السعال أو الضوضاء طلباً، لكن إذا شخص في الغرفة كلّمك بصوت هادي أو من بعيد اسمعيه وجاوبيه طبيعي. وإذا صحّح لك كلمة أسأتِ سماعها اتركي الموضوع الغلط فوراً وجاوبي على المعنى الصحيح. "+
+			"طلب المساعدة والأدوات: إذا كان الطلب يعتمد على البيت أو التلفزيون (بجملة طبيعية أو مركّبة) أو الذاكرة (حفظ اسم/شخص/مكان غرض أو استرجاعه) أو قائمة المقاضي أو التذكيرات أو مؤقت الطبخ أو مواقيت الصلاة والتاريخ الهجري أو الطقس أو القرآن والتفسير والأذكار أو تحويل المطبخ والعملات أو الأخبار والأسعار وأي تطبيق أو اسم جديد — اطلبي المساعدة فوراً قبل ما تجاوبين، ولا تخمّنين وأنتِ تنتظرين، ولا تقولي «لحظة» ولا «ثواني»: الخط يقولها عنك وأنتِ اسكتي لين يجيك الجواب. أما المعلومات العامة الأكيدة والسوالف اليومية والأفكار فجاوبيها على طول بدفء واختصار. "+
+			"الذكاء والطبيعية: عملتك الافتراضية دائماً الريال السعودي والسوق السعودية. ممنوع تماماً تقولين «اكتبي لي» أو «أرسلي صورة» أو «وين شفتيه؟» — المتحدث يكلمك بصوته فقط! وممنوع تختمين بجمل آلية متكررة مثل «هل لديك سؤال آخر؟». "+
+			"لا ترحّبي مرة ثانية في نفس المكالمة ولا تعيدي شي قلتيه. وإذا ما فهمتِ قولي ذلك بلطف في جملة قصيرة. إذا ودّعك المتحدث أو طلب تقفلين المكالمة، لا تودّعيه بنفسك: اطلبي المساعدة على طول واسكتي، والمساعدة هي اللي تودّعه وتقفل الخط.", "system instructions")
 		voice       = flag.String("voice", "", "GPT-Live voice name (empty = provider default)")
 		standbyIdle = flag.Int("standby-idle", 0, "OpenAI Live standby timeout in seconds (5-60); drops idle billing from $0.05/min to $0.02/min while keeping the session warm. 0 disables")
 		standbyVAD  = flag.Float64("standby-vad", 0.25, "VAD speech threshold (0-1) to wake a standby session when --standby-idle is set (0.25 hears quiet/far-field voices reliably)")
@@ -972,17 +1060,25 @@ func main() {
 		maxSess   = flag.Duration("max-session", 90*time.Minute, "hard cap per Echo session")
 		marker    = flag.Bool("set-marker", false, "set marker=true on packets forwarded to OpenAI (undocumented; the one prior-art bridge did this)")
 		fork      = flag.Bool("fork", false, "resume the stored conversation on the next call (fork). Needs data persistence enabled on the OpenAI project: a project without it rejects store:true, and measured on 28 calls that refusal cost the first call after every restart 400-900 ms before the retry without store succeeded. Off by default so the OpenAI leg is ready sooner")
-		maxLive   = flag.Duration("max-live", 10*time.Minute, "hang up the OpenAI session after this long no matter what (it bills wall clock)")
+		maxLive   = flag.Duration("max-live", 25*time.Minute, "hang up the OpenAI session after this long no matter what (it bills wall clock)")
 		kickSB    = flag.Duration("test-kick-sideband-after", 0, "TEST HOOK, never set in service: this long after the OpenAI leg is up, close its control socket from this side so the reattach path runs against the real service. 0 disables")
 		warm      = flag.Duration("warm-openai", 60*time.Second, "touch OpenAI this often so the HTTPS connection is still open when a call arrives. Measured: creating a session took 1570 ms on a cold connection and 758 ms on a warm one, and every call was cold. Under the 90 s after which Go drops an idle connection. 0 disables")
 		toolsOn   = flag.Bool("tools", false, "let the assistant use tools when it delegates: the machine's state, today's spend, his notes, things on the home network. Off by default because every tool is reachable by anyone who can speak in the room")
 		searchOn    = flag.String("web-search", "free", "how it searches the web. \"free\" uses Keenable Search (free tier: 100k/mo with --keenable-key-file or keyless public endpoint) with DuckDuckGo and Wikipedia fallback, costing $0 in search fees. \"private\" queries DuckDuckGo and Wikipedia directly without third-party search APIs. \"openai\" is OpenAI's built-in search at a cent a call. \"off\" disables web search")
 		keenableKey = flag.String("keenable-key-file", os.ExpandEnv("$HOME/.config/acv/keenable.key"), "optional Keenable API key file for free-tier 100k/mo + realtime search (falls back to KEENABLE_API_KEY env or keyless public endpoint)")
-		searchMd    = flag.String("search-model", openai.SearchModel, "the cheap model that routes tool calls and runs searches. Not the voice model and not the heavy one")
-		searchFx  = flag.String("search-effort", "", "how hard the router thinks: minimal|low|medium, or off for a model without reasoning. Empty is low, the least that still decides to use a tool")
+		searchMd      = flag.String("search-model", openai.SearchModel, "the mastermind model that routes tool calls and answers delegations (e.g. gpt-6.2-sol or gpt-4.1-mini)")
+		searchFx      = flag.String("search-effort", "", "how hard the router thinks: minimal|low|medium|high, or off for a model without reasoning")
+		searchTier    = flag.String("search-tier", envOr("BRIDGE_SEARCH_TIER", ""), "optional OpenAI service_tier for the router ('fast' or 'priority' for Fast Mode, empty = default)")
+		visionMd      = flag.String("vision-model", envOr("BRIDGE_VISION_MODEL", "gpt-6.2-sol"), "high-IQ Vision model for TV Computer-Use screenshots")
+		visionFx      = flag.String("vision-effort", envOr("BRIDGE_VISION_EFFORT", "low"), "reasoning effort for TV Vision (low|medium|high|off)")
+		visionTier    = flag.String("vision-tier", envOr("BRIDGE_VISION_TIER", "fast"), "optional OpenAI service_tier for TV Vision ('fast' or 'priority', empty = default)")
+		reflectMd     = flag.String("reflect-model", envOr("BRIDGE_REFLECT_MODEL", "gpt-6.2-sol"), "model for background post-call memory extraction (runs after hangup at standard tier)")
+		reflectFx     = flag.String("reflect-effort", envOr("BRIDGE_REFLECT_EFFORT", "high"), "reasoning effort for post-call memory extraction (low|medium|high|off)")
 		vaultURL  = flag.String("vault-url", "", "where cmd/vaultd is serving his notes, e.g. http://<pc-on-the-lan>:8791. Empty disables the notes tools")
 		vaultKey  = flag.String("vault-key-file", "", "file holding the shared secret vaultd expects")
 		homeEPs   = flag.String("home-endpoints", "", "things on the home network the assistant may ask, as name=url,name=url. Read-only, and the model can only pick a name")
+		tvURL     = flag.String("tv-url", "", "tvd (tvd/server.py), e.g. http://127.0.0.1:8831. Set, it turns on the TV remote by voice: \"شغّل التلفزيون\" and, in remote mode, single words like يمين/اضغط/ارجع press keys at once, read straight off his transcript without a delegation. Empty disables it")
+		tvKeyFile = flag.String("tv-key-file", os.ExpandEnv("$HOME/.config/tvd/signing.key"), "tvd's own signing key (not the bridge's)")
 		logSvcs   = flag.String("log-services", "bridge", "which services it may read warnings from, comma separated")
 		bye       = flag.String("farewell", "", "comma-separated phrases that end the call when the user says them. Empty uses the built-in Arabic and English list; \"off\" disables it")
 		byeGrace  = flag.Duration("farewell-grace", 800*time.Millisecond, "how long to wait after she stops speaking a goodbye before closing the line")
@@ -993,7 +1089,7 @@ func main() {
 		opusFmtp  = flag.String("opus-fmtp", bridge.DefaultOpusFmtp, "Opus fmtp asked of BOTH remote encoders (the Echo's and OpenAI's). Empty keeps the browser default")
 		noiseRed  = flag.String("noise-reduction", "off", "OpenAI input noise reduction: far_field, near_field or off. gpt-live-1 REJECTS this (measured: unknown_parameter session.audio.input); kept for the Realtime fallback")
 		recDir    = flag.String("record-dir", "", "write both audio directions to Ogg/Opus here (no transcoding: the files are exactly what crossed the bridge). Empty = off")
-		greeting  = flag.String("greeting", "", "Ogg/Opus file (one 20 ms packet per page) the bridge itself plays to the Echo the moment its transport is up, ~1.5 s before the OpenAI leg is ready. media/hala.ogg is her own «هلا» cut from a recording. Measured: the model's own hello reached the Echo 5-7 s after the offer; this reaches it at ~2 s, and the model is told not to greet again. Empty: the model greets")
+		greeting  = flag.String("greeting", "", "Ogg/Opus file (one 20 ms packet per page) the bridge itself plays to the Echo the moment its transport is up, ~1.5 s before the OpenAI leg is ready. media/hala.ogg is her own «هلا» cut from a recording. Measured: the model's own hello reached the Echo 5-7 s after the offer; this reaches it at ~2 s, and the model is told not to greet again. WARNING, measured twice on 2026-09-16 (15:15 and 18:24): with the clip on, Amazon's media server stopped sending the Echo's microphone after 8-20 packets, at the moment the clip's audio reached it, and she never heard him; every call whose first outbound audio came later (~4 s) worked. Leave it empty until that is understood. Empty: the bridge has her say «هلا» through the OpenAI leg as soon as the session is up (~3.5-4 s)")
 		budgetUSD = flag.Float64("daily-budget-usd", 1.0, "refuse to open a new GPT-Live session once this much has been spent today. Counted on disk per UTC day and shared with every other process on this machine. 0 disables the ceiling but keeps counting")
 		budgetP   = flag.String("budget-file", os.ExpandEnv("$HOME/.local/state/rtcdiag/spend.json"), "where the shared daily spend counter lives")
 		ledgerP   = flag.String("ledger", os.ExpandEnv("$HOME/.local/state/rtcdiag/open-live-sessions"), "file recording OpenAI sessions that are open and billing, so a killed process can be recovered from")
@@ -1087,7 +1183,9 @@ func main() {
 		kickSidebandAfter: *kickSB,
 		maxSess:           *maxSess,
 		instr:             *instr,
+		household:         strings.TrimSpace(*household),
 		mem:               openMemory(*memFile),
+		timers:            tools.NewTimerManager(),
 		logText:           *logText,
 		place:             *place,
 		tz:                mustZone(*tz),
@@ -1115,6 +1213,17 @@ func main() {
 		}
 		a.farewell = bridge.NewFarewell(phrases, a.ev)
 	}
+	var tvClient *tv.Client
+	if *tvURL != "" {
+		b, terr := os.ReadFile(*tvKeyFile)
+		tk := []byte(strings.TrimSpace(string(b)))
+		if terr != nil || len(tk) < 32 {
+			fmt.Fprintln(os.Stderr, "tv key file: missing or shorter than 32 bytes:", *tvKeyFile)
+			os.Exit(2)
+		}
+		tvClient = tv.New(*tvURL, tk)
+		a.remote = newRemote(tvClient, a.ev)
+	}
 	a.live = openai.NewLive(apiKey, *model)
 	a.live.OnEvent = a.ev
 	if bud, berr := openai.NewBudget(*budgetP, *budgetUSD, a.ev); berr != nil {
@@ -1139,12 +1248,32 @@ func main() {
 		// seconds and returns a page about the weather; this is the reading, in half a second.
 		if *lat != 0 || *lon != 0 {
 			reg.Add(tools.Weather(*lat, *lon, *tz, nil))
-			reg.Add(tools.Prayer(*lat, *lon, *tz, nil))
+			reg.Add(tools.PrayerWithMethod(*lat, *lon, *tz, *prayerMethod, nil))
+		}
+		refreshCtx := func() {
+			if a.assist != nil {
+				a.assist.refreshContext()
+			}
 		}
 		if a.mem != nil {
-			reg.Add(tools.RememberThis(a.mem))
+			reg.Add(tools.RememberThis(a.mem, refreshCtx))
+			reg.Add(tools.RecallMemory(a.mem))
 			reg.Add(tools.WhatYouKnow(a.mem))
+			reg.Add(tools.ForgetMemory(a.mem, refreshCtx))
 		}
+		if strings.TrimSpace(*shoppingFile) != "" {
+			reg.Add(tools.ShoppingList(*shoppingFile))
+		}
+		if strings.TrimSpace(*remindersFile) != "" {
+			remStore := tools.NewReminderStore(*remindersFile)
+			reg.Add(tools.Reminders(remStore, a.tz))
+			reg.Add(tools.TodayReminders(remStore, a.tz))
+		}
+		if a.timers != nil {
+			reg.Add(tools.KitchenTimer(a.timers))
+		}
+		reg.Add(tools.QuranLookup(nil))
+		reg.Add(tools.Convert(nil))
 		if *vaultURL != "" {
 			vk := ""
 			if *vaultKey != "" {
@@ -1187,6 +1316,18 @@ func main() {
 			fmt.Fprintf(os.Stderr, "--web-search must be free, private, openai or off, not %q\n", *searchOn)
 			os.Exit(2)
 		}
+		if tvClient != nil {
+			reg.Add(tools.TVControl(tvClient, a.remote.Activate))
+			reg.Add(tools.TVVision(tools.TVVisionConfig{
+				Client:      tvClient,
+				APIKey:      apiKey,
+				Model:       *visionMd,
+				Effort:      *visionFx,
+				ServiceTier: *visionTier,
+				Web:         web,
+				OnActive:    a.remote.Activate,
+			}))
+		}
 		if web != nil {
 			reg.Add(web.SearchTool())
 			reg.Add(web.OpenTool())
@@ -1198,8 +1339,9 @@ func main() {
 		a.assist = &assistant{
 			answerer: &openai.Answerer{
 				APIKey: apiKey, Model: *searchMd, Tools: reg, OnEvent: a.ev,
-				WebSearch: payForSearch, MaxOutputTokens: 1500, Deadline: 25 * time.Second,
-				Reasoning: *searchFx,
+				WebSearch: payForSearch, MaxOutputTokens: 2200, Deadline: 45 * time.Second,
+				Reasoning: *searchFx, ServiceTier: *searchTier, ReflectModel: *reflectMd,
+				ReflectEffort: *reflectFx,
 			},
 			window:        newTranscriptWindow(45 * time.Second),
 			pending:       &pendingWrite{},
@@ -1212,6 +1354,9 @@ func main() {
 		if a.farewell != nil {
 			f := a.farewell
 			a.assist.hangUp = func(at time.Time) bool { return f.Arm("end_call", at) }
+		}
+		if a.remote != nil {
+			a.assist.skip = a.remote.handles
 		}
 		a.ev("tools_ready", "tools", reg.Names(), "web_search", *searchOn, "keenable_key", keenableAPIKey != "", "paid_search", payForSearch, "model", *searchMd)
 	}
@@ -1246,7 +1391,8 @@ func main() {
 		"opus_fmtp", *opusFmtp, "noise_reduction", *noiseRed, "pace_ms", pace.Milliseconds(),
 		"video_stream_id", *vStream, "ext", *ext, "spurt_marker", *mark,
 		"farewell", *bye != "off", "farewell_grace_s", byeGrace.Seconds(),
-		"daily_budget_usd", *budgetUSD, "tools", *toolsOn, "web_search", *searchOn)
+		"daily_budget_usd", *budgetUSD, "tools", *toolsOn, "web_search", *searchOn,
+		"tv_remote", a.remote != nil)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1309,6 +1455,11 @@ const farewellMaxWait = 6 * time.Second
 // be heard ends within about three minutes instead of at the ten-minute cap.
 const sidebandLostGrace = 2 * time.Minute
 
+// greetingWait bounds her «هلا»: the wait for the Echo's transport plus the clip itself. The Echo
+// connects 1.3-2.2 s after the offer and the clip is 0.8 s; a call that has not connected by
+// then is not going to be greeted, and nothing else should wait on it.
+const greetingWait = 8 * time.Second
+
 // farewellReplyWait is how long his goodbye waits for hers to BEGIN. Measured replies start 0.8-2 s
 // after his words; a model that says nothing at all ends the call after this instead.
 const farewellReplyWait = 2500 * time.Millisecond
@@ -1330,9 +1481,8 @@ func (a *app) watchFarewell(leg *bridge.LiveLeg, f *bridge.Farewell) {
 	for range t.C {
 		a.mu.Lock()
 		cur := a.leg
-		session := a.sess
 		a.mu.Unlock()
-		if cur != leg || session == nil {
+		if cur != leg {
 			return // this call is over; the watcher belongs to it
 		}
 		phrase, at, armed := f.Armed()
@@ -1357,19 +1507,13 @@ func (a *app) watchFarewell(leg *bridge.LiveLeg, f *bridge.Farewell) {
 		case replied && quiet < a.byeGrace && waited < farewellMaxWait:
 			continue // still saying her own goodbye; let her finish
 		}
-		a.mu.Lock()
-		if a.leg != leg || a.sess != session {
-			a.mu.Unlock()
-			return
-		}
 		f.Disarm()
-		a.mu.Unlock()
 		a.ev("farewell_close", "phrase", phrase, "grace_s", a.byeGrace.Seconds(), "replied", replied,
 			"quiet_s", quiet.Seconds(), "waited_s", waited.Seconds(),
 			"note", "she finished, so the whole call ends: OpenAI stops billing and the Echo transport is dropped; whether Alexa then ends the call on the device is not yet known")
 		// teardown, not closeLeg: the Echo session goes down too, so Alexa ends the call instead of
 		// leaving him holding an open line.
-		a.teardownFor(session, "farewell")
+		a.teardown("farewell")
 		return
 	}
 }

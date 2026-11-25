@@ -37,9 +37,6 @@ func HomeNetwork(endpoints []Endpoint, client *http.Client) *Tool {
 		// actually goes, which hands the choice back to somebody outside this file.
 		client = &http.Client{Timeout: 5 * time.Second, CheckRedirect: noRedirect}
 	}
-	copyClient := *client
-	copyClient.CheckRedirect = noRedirect
-	client = &copyClient
 	byName := map[string]Endpoint{}
 	names := make([]string, 0, len(endpoints))
 	for _, e := range endpoints {
@@ -80,10 +77,7 @@ func HomeNetwork(endpoints []Endpoint, client *http.Client) *Tool {
 				return fmt.Sprintf("%s did not answer.", what), nil
 			}
 			defer res.Body.Close()
-			body, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-			if err != nil {
-				return "", fmt.Errorf("%s response could not be read: %w", what, err)
-			}
+			body, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
 			if res.StatusCode >= 300 {
 				return fmt.Sprintf("%s answered with an error, status %d.", what, res.StatusCode), nil
 			}
@@ -98,8 +92,8 @@ func HomeNetwork(endpoints []Endpoint, client *http.Client) *Tool {
 // oneLine flattens a response into something speakable and short.
 func oneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if r := []rune(s); len(r) > max {
-		s = string(r[:max]) + "..."
+	if len(s) > max {
+		s = s[:max] + "..."
 	}
 	if s == "" {
 		return "It answered with nothing."

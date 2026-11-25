@@ -259,8 +259,10 @@ func (w *Web) Speculative(ctx context.Context, said string) string {
 var (
 	worldRE = regexp.MustCompile(`(?i)سعر|اسعار|أسعار|بكم|كم يسوى|يسوى|كم تكلف|تكلفة|اخبار|أخبار|خبر|نتيجه|نتيجة|نتائج|مباراه|مباراة|فاز|احدث|أحدث|اخر اصدار|آخر اصدار|صدر|وش صار|ابحث|دور لي|شوف لي|الذهب|الدولار|سهم|اسهم|بيتكوين|بورصة|تطبيق|برنامج|اداة|أداة|موقع|لعبة|لعبه|اشهر|أشهر|مشهور|مشهورة|مشهوره|شركة|شركه|شركات|ماركة|ماركه|منتج|مناديل|افضل|أفضل|احسن|أحسن|مواصفات|` +
 		`price|cost|how much (is|does|do|are)|news|score|who won|latest|newest|release|search|look up|stock|bitcoin|gold|dollar|exchange rate|what happened|\bapp\b|software|program|website|best|popular|brand|company`)
-	localRE = regexp.MustCompile(`(?i)صرفت|صرف|ميزانيه|ميزانية|الجهاز|السيرفر|الذاكره|الذاكرة|تذكر|ملاحظات|البيت|الشبكه|الشبكة|` +
-		`spent|spend|budget|machine|server|memory|remember|notes|vault|house|network`)
+	localRE = regexp.MustCompile(`(?i)صرفت|صرف|ميزانيه|ميزانية|الجهاز|السيرفر|الذاكره|الذاكرة|تذكر|تذكري|احفظ|احفظي|ملاحظات|البيت|الشبكه|الشبكة|` +
+		`تلفزيون|تلفاز|الشاشه|الشاشة|نتفلكس|نتفليكس|يوتيوب|شاهد|الريموت|ريموت|ميوت|مقطع|فيديو|فلم|فيلم|مسلسل|حلقه|حلقة|وين وصلنا|كاميرات|الكاميرات|الشاومي|شاومي|اتش دي ام اي|قناة|قناه|بندريتا|سبايدر|` +
+		`شغلي|شغل|افتحي|افتح|ارجعي|رجوع|فوق|تحت|يمين|يسار|اضغط|اضغطي|مقاضي|تذكير|ذكريني|مؤقت|صلاة|صلاه|المغرب|الفجر|الظهر|العصر|العشاء|هجري|قرآن|قران|آية|ايه|تفسير|أذكار|اذكار|تسبيح|دعاء|` +
+		`spent|spend|budget|machine|server|memory|remember|notes|vault|house|network|netflix|youtube|shahid|remote|mute|hdmi|cameras?|xiaomi|banderita|spider|\btv\b`)
 )
 
 func WorldCue(said string) bool {
@@ -271,7 +273,7 @@ func WorldCue(said string) bool {
 
 // publicTransport dials only public addresses, checked at the moment of dialling. The name check
 // in publicHTTP is not enough on its own: a name is resolved by whoever owns it, and a result
-// whose domain resolves to 192.168.1.1 - by design or by rebinding between check and dial - would
+// whose domain resolves to 192.168.8.1 - by design or by rebinding between check and dial - would
 // otherwise reach the router next door. So the resolution happens here, every address it returns
 // is checked, and the connection goes to the checked address and no other. TLS still verifies
 // the certificate against the name, because the request's host is what the transport uses for
@@ -375,7 +377,7 @@ func fetchPage(ctx context.Context, client *http.Client, page string) (string, e
 		return "", fmt.Errorf("not a page (%s)", strings.SplitN(ct, ";", 2)[0])
 	}
 	body, err := io.ReadAll(io.LimitReader(res.Body, pageLimit))
-	if err != nil {
+	if err != nil && len(body) == 0 {
 		return "", err
 	}
 	return htmlToText(string(body)), nil

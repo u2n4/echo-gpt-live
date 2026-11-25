@@ -19,21 +19,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/u2n4/echo-gpt-live/internal/memory"
 	"github.com/u2n4/echo-gpt-live/internal/openai"
 	"github.com/u2n4/echo-gpt-live/internal/tools"
+	"github.com/u2n4/echo-gpt-live/internal/tv"
 )
 
 func main() {
 	var (
-		keyFile     = flag.String("openai-key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "OpenAI API key file")
-		keenableKey = flag.String("keenable-key-file", os.ExpandEnv("$HOME/.config/acv/keenable.key"), "optional Keenable API key file")
-		model       = flag.String("model", openai.SearchModel, "the router model to measure")
-		effort      = flag.String("effort", "", "reasoning effort: empty = the bridge's default, or minimal|low|medium|off")
-		search      = flag.String("web-search", "free", "free|private|openai|off, as in the bridge")
-		prefetch    = flag.Bool("prefetch", true, "search for the words before the first round, as the bridge does")
-		where       = flag.String("context", "", "what the router is told about where and when (empty = a weekday afternoon)")
-		n           = flag.Int("n", 1, "how many times to ask, for a spread")
-		deadl       = flag.Duration("deadline", 25*time.Second, "the bridge's delegation deadline")
+		keyFile      = flag.String("openai-key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "OpenAI API key file")
+		keenableKey  = flag.String("keenable-key-file", os.ExpandEnv("$HOME/.config/acv/keenable.key"), "optional Keenable API key file")
+		model        = flag.String("model", openai.SearchModel, "the router model to measure")
+		effort       = flag.String("effort", "", "reasoning effort: empty = the bridge's default, or minimal|low|medium|off")
+		tier         = flag.String("tier", "", "optional OpenAI service_tier (fast|priority)")
+		visionModel  = flag.String("vision-model", "gpt-6.2-sol", "TV Vision model")
+		visionEffort = flag.String("vision-effort", "low", "TV Vision reasoning effort (low|medium|high|off)")
+		visionTier   = flag.String("vision-tier", "fast", "TV Vision service_tier")
+		search       = flag.String("web-search", "free", "free|private|openai|off, as in the bridge")
+		prefetch     = flag.Bool("prefetch", true, "search for the words before the first round, as the bridge does")
+		homeTools    = flag.Bool("home-tools", false, "register household tools (prayer, weather, memory, shopping, reminders, timer, quran, convert)")
+		prayerMethod = flag.Int("prayer-method", 0, "Aladhan prayer calculation method when --home-tools is set (0 = Shia Ja'fari)")
+		tvURL        = flag.String("tv-url", "", "optional tvd URL (e.g. http://127.0.0.1:8831) to include tv_control")
+		tvKeyFile    = flag.String("tv-key-file", os.ExpandEnv("$HOME/.config/tvd/signing.key"), "tvd signing key file")
+		where        = flag.String("context", "", "what the router is told about where and when (empty = Riyadh default)")
+		n            = flag.Int("n", 1, "how many times to ask, for a spread")
+		deadl        = flag.Duration("deadline", 25*time.Second, "the bridge's delegation deadline")
 	)
 	flag.Parse()
 	question := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -76,6 +86,39 @@ func main() {
 		reg.Add(web.SearchTool())
 		reg.Add(web.OpenTool())
 	}
+	if *homeTools {
+		tmp, _ := os.MkdirTemp("", "answertest-*")
+		defer os.RemoveAll(tmp)
+		reg.Add(tools.Weather(24.7136, 46.6753, "Asia/Riyadh", nil))
+		reg.Add(tools.PrayerWithMethod(24.7136, 46.6753, "Asia/Riyadh", *prayerMethod, nil))
+		if mem, merr := memory.Open(tmp + "/memory.md"); merr == nil {
+			reg.Add(tools.RememberThis(mem, nil))
+			reg.Add(tools.RecallMemory(mem))
+			reg.Add(tools.WhatYouKnow(mem))
+			reg.Add(tools.ForgetMemory(mem, nil))
+		}
+		reg.Add(tools.ShoppingList(tmp + "/shopping.md"))
+		rs := tools.NewReminderStore(tmp + "/reminders.json")
+		reg.Add(tools.Reminders(rs, riyadh()))
+		reg.Add(tools.TodayReminders(rs, riyadh()))
+		reg.Add(tools.KitchenTimer(tools.NewTimerManager()))
+		reg.Add(tools.QuranLookup(nil))
+		reg.Add(tools.Convert(nil))
+	}
+	if *tvURL != "" {
+		if tk, terr := os.ReadFile(*tvKeyFile); terr == nil {
+			tc := tv.New(*tvURL, []byte(strings.TrimSpace(string(tk))))
+			reg.Add(tools.TVControl(tc, nil))
+			reg.Add(tools.TVVision(tools.TVVisionConfig{
+				Client:      tc,
+				APIKey:      apiKey,
+				Model:       *visionModel,
+				Effort:      *visionEffort,
+				ServiceTier: *visionTier,
+				Web:         web,
+			}))
+		}
+	}
 	reg.Add(tools.EndCall())
 
 	start := time.Now()
@@ -90,14 +133,15 @@ func main() {
 
 	ans := &openai.Answerer{
 		APIKey: apiKey, Model: *model, Tools: reg, OnEvent: ev,
-		WebSearch: payForSearch, MaxOutputTokens: 1500, Deadline: *deadl, Reasoning: *effort,
+		WebSearch: payForSearch, MaxOutputTokens: 2200, Deadline: *deadl,
+		Reasoning: *effort, ServiceTier: *tier,
 	}
 	if web != nil && *prefetch {
 		ans.Prefetch = web.Speculative
 	}
 	ctxText := *where
 	if ctxText == "" {
-		ctxText = "The user is at home. It is " +
+		ctxText = "He is at home in Riyadh, Saudi Arabia. It is " +
 			time.Now().In(riyadh()).Format("Monday 2 January 2006, 15:04") + " local time."
 	}
 	ans.SetContext(ctxText)

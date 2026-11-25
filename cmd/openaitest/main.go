@@ -31,16 +31,6 @@ import (
 	"github.com/u2n4/echo-gpt-live/internal/openai"
 )
 
-func speakOnceAt(runCtx context.Context, speakAt string, play func(string)) func(string) {
-	var speakOnce sync.Once
-	return func(when string) {
-		if when != speakAt || runCtx.Err() != nil {
-			return
-		}
-		speakOnce.Do(func() { play(when) })
-	}
-}
-
 func main() {
 	var (
 		keyFile  = flag.String("key-file", os.ExpandEnv("$HOME/.config/acv/openai.key"), "file holding the OpenAI API key")
@@ -69,10 +59,6 @@ func main() {
 		budgetUS = flag.Float64("daily-budget-usd", 2.0, "refuse to open a session once this much has been spent today (0 = count only)")
 	)
 	flag.Parse()
-	if *api != "live" && *api != "realtime" {
-		fmt.Fprintln(os.Stderr, "--api must be live or realtime")
-		os.Exit(2)
-	}
 
 	key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if key == "" {
@@ -82,10 +68,6 @@ func main() {
 			os.Exit(2)
 		}
 		key = strings.TrimSpace(string(b))
-	}
-	if key == "" {
-		fmt.Fprintln(os.Stderr, "API key is empty")
-		os.Exit(2)
 	}
 	lg, err := diag.NewLogger(*runsDir, "openai-"+time.Now().UTC().Format("20060102T150405Z"))
 	if err != nil {
@@ -276,25 +258,28 @@ func main() {
 	// The file is spoken once, from whichever moment --speak-at names; the first caller wins.
 	runCtx, cancel := context.WithTimeout(ctx, *dur)
 	defer cancel()
-	speak := speakOnceAt(runCtx, *speakAt, func(when string) {
-		if _, err := os.Stat(*audioF); err != nil {
-			lg.Event("no_audio_file", "path", *audioF, "note", "session will stay silent; use --audio-file to speak")
-			return
-		}
-		lg.Event("speak_start", "at", when, "ms_since_start", time.Since(start).Milliseconds(), "rtp_burst", *rtpBurst)
-		onErr := func(e error) { lg.Event("audio_file_error", "err", e.Error()) }
-		if *rtpBurst {
-			go playRTP(runCtx, *audioF, rtpTrack, *burst, onErr)
-			return
-		}
-		go bridge.PlayOggOnce(runCtx, *audioF, track, *burst, onErr)
-	})
+	var speakOnce sync.Once
+	speak := func(when string) {
+		speakOnce.Do(func() {
+			if _, err := os.Stat(*audioF); err != nil {
+				lg.Event("no_audio_file", "path", *audioF, "note", "session will stay silent; use --audio-file to speak")
+				return
+			}
+			lg.Event("speak_start", "at", when, "ms_since_start", time.Since(start).Milliseconds(), "rtp_burst", *rtpBurst)
+			onErr := func(e error) { lg.Event("audio_file_error", "err", e.Error()) }
+			if *rtpBurst {
+				go playRTP(runCtx, *audioF, rtpTrack, *burst, onErr)
+				return
+			}
+			go bridge.PlayOggOnce(runCtx, *audioF, track, *burst, onErr)
+		})
+	}
 	if *speakAt == "connected" {
 		go func() {
 			select {
 			case <-connected:
 				speak("connected")
-			case <-runCtx.Done():
+			case <-ctx.Done():
 			}
 		}()
 	}
@@ -336,7 +321,7 @@ func main() {
 		case "responses":
 			cfg.Delegation = openai.ResponsesDelegation(*backend, *effort, "Answer briefly and concretely.")
 		}
-		ls, cerr := lc.CreateSession(runCtx, offerSDP, cfg)
+		ls, cerr := lc.CreateSession(ctx, offerSDP, cfg)
 		if cerr != nil {
 			lg.Event("openai_create_failed", "err", cerr.Error())
 			fmt.Fprintln(os.Stderr, "create live session:", cerr)
@@ -345,9 +330,7 @@ func main() {
 		sessionID, answerSDP = ls.ID, ls.Answer
 		opened := time.Now()
 		hangupFn = func() {
-			hctx, cancelHangup := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancelHangup()
-			if err := lc.HangupRetry(hctx, ls.ID, 3); err != nil {
+			if err := lc.Hangup(context.Background(), ls.ID); err != nil {
 				lg.Event("openaitest_hangup_failed", "session_id", ls.ID, "err", err.Error())
 				fmt.Fprintln(os.Stderr, "hangup:", err)
 			}
@@ -355,7 +338,6 @@ func main() {
 			// init charge undercounted every minute it stayed open. Muse found it.
 			lc.Budget.Spent(time.Since(opened))
 		}
-		go func() { <-runCtx.Done(); hangup() }()
 		if serr := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); serr != nil {
 			lg.Event("set_remote_failed", "err", serr.Error())
 			fmt.Fprintln(os.Stderr, "set remote:", serr)
@@ -363,7 +345,7 @@ func main() {
 			os.Exit(1)
 		}
 		var liveSB *openai.LiveSideband
-		if sb, aerr := lc.Attach(runCtx, ls.ID); aerr != nil {
+		if sb, aerr := lc.Attach(ctx, ls.ID); aerr != nil {
 			// not fatal: the data channel still carries events
 			lg.Event("live_attach_failed", "err", aerr.Error())
 		} else {
@@ -374,24 +356,22 @@ func main() {
 				}
 			}()
 			go func() {
-				if err := sb.Read(runCtx, func(typ string, raw []byte) {
+				if err := sb.Read(ctx, func(typ string, raw []byte) {
 					if strings.Contains(typ, "transcript") || strings.Contains(typ, "text") || strings.Contains(typ, "delta") {
 						lg.Event("live_sideband_event", "type", typ, "chars", len(raw))
 						return
 					}
-					lg.Event("live_sideband_event", "type", typ, "bytes", len(raw))
+					lg.Event("live_sideband_event", "type", typ, "raw", clip(string(raw), 400))
 				}); err != nil {
 					lg.Event("live_sideband_read_failed", "err", err.Error())
 				}
 			}()
 		}
 		select {
-		case <-runCtx.Done():
-			hangup()
 		case <-dcStarted:
 			lg.Event("live_session_started", "ms_since_start", time.Since(start).Milliseconds())
 			if *sayHello && liveSB != nil {
-				hctx, hcancel := context.WithTimeout(runCtx, 5*time.Second)
+				hctx, hcancel := context.WithTimeout(ctx, 5*time.Second)
 				if err := liveSB.Commentary(hctx, "", "هلا."); err != nil {
 					lg.Event("hello_failed", "err", err.Error())
 				} else {
@@ -409,7 +389,7 @@ func main() {
 		}
 		cl := openai.New(key, mdl)
 		cl.OnEvent = lg.Event
-		call, cerr := cl.CreateCall(runCtx, offerSDP)
+		call, cerr := cl.CreateCall(ctx, offerSDP)
 		if cerr != nil {
 			lg.Event("openai_create_failed", "err", cerr.Error())
 			fmt.Fprintln(os.Stderr, "create call:", cerr)
@@ -417,21 +397,18 @@ func main() {
 		}
 		sessionID, answerSDP = call.ID, call.Answer
 		hangupFn = func() {
-			hctx, cancelHangup := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancelHangup()
-			if err := cl.Hangup(hctx, call.ID); err != nil {
+			if err := cl.Hangup(context.Background(), call.ID); err != nil {
 				lg.Event("openaitest_hangup_failed", "session_id", call.ID, "err", err.Error())
 				fmt.Fprintln(os.Stderr, "hangup:", err)
 			}
 		}
-		go func() { <-runCtx.Done(); hangup() }()
 		if serr := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); serr != nil {
 			lg.Event("set_remote_failed", "err", serr.Error())
 			fmt.Fprintln(os.Stderr, "set remote:", serr)
 			hangup()
 			os.Exit(1)
 		}
-		sb, aerr := cl.Attach(runCtx, call.ID)
+		sb, aerr := cl.Attach(ctx, call.ID)
 		if aerr != nil {
 			lg.Event("openai_attach_failed", "err", aerr.Error())
 			fmt.Fprintln(os.Stderr, "attach:", aerr)
@@ -444,11 +421,11 @@ func main() {
 			}
 		}()
 		go func() {
-			if err := sb.Read(runCtx); err != nil {
+			if err := sb.Read(ctx); err != nil {
 				lg.Event("realtime_sideband_read_failed", "err", err.Error())
 			}
 		}()
-		if uerr := sb.SessionUpdate(runCtx, map[string]any{
+		if uerr := sb.SessionUpdate(ctx, map[string]any{
 			"type":         "realtime",
 			"instructions": *instr,
 			"audio": map[string]any{
@@ -470,8 +447,7 @@ func main() {
 		hangup()
 		stop()
 	})
-	touch := gate.Touch
-	gateTouchFn.Store(&touch)
+	gateTouchFn = gate.Touch
 	defer gate.Stop()
 
 	// Optional: one straight-to-backend measurement so the heavy path has real numbers too.
@@ -491,7 +467,7 @@ func main() {
 				lg.Event("backend_progress", "phase", phase, "chars", chars, "seconds", elapsed.Seconds())
 			}
 		}
-		if r, aerr := be.Ask(runCtx, *askKind, "Answer briefly and concretely.", *ask, 2048); aerr != nil {
+		if r, aerr := be.Ask(ctx, *askKind, "Answer briefly and concretely.", *ask, 2048); aerr != nil {
 			lg.Event("backend_failed", "err", aerr.Error())
 		} else {
 			lg.Event("backend_result", "effort", r.Effort, "seconds", r.Elapsed.Seconds(),
@@ -507,7 +483,7 @@ func main() {
 		go func() {
 			select {
 			case <-time.After(*speakDelay):
-				speak("started")
+				speak("delayed")
 			case <-runCtx.Done():
 			}
 		}()
@@ -555,11 +531,11 @@ func summarizeAnswer(lg *diag.Logger, sdp string) {
 }
 
 // gateTouchFn is installed once the idle gate exists; inbound audio before that needs no gating.
-var gateTouchFn atomic.Pointer[func()]
+var gateTouchFn func()
 
 func gateTouch() {
-	if fn := gateTouchFn.Load(); fn != nil {
-		(*fn)()
+	if gateTouchFn != nil {
+		gateTouchFn()
 	}
 }
 

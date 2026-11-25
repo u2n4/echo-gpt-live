@@ -49,11 +49,7 @@ func TestExcerptListsMoneyWithItsLabel(t *testing.T) {
 	if !strings.Contains(out, "Series 2 — 769.00 SAR") {
 		t.Errorf("number-then-currency should be found too: %q", out)
 	}
-	start, end := strings.Index(out, "Money on the page:"), strings.Index(out, "\nText:")
-	if start < 0 || end <= start {
-		t.Fatalf("money/text sections missing: %q", out)
-	}
-	money := out[start:end]
+	money := out[strings.Index(out, "Money on the page:"):strings.Index(out, "\nText:")]
 	if strings.Count(money, "SAR 224.95") != 1 {
 		t.Errorf("a repeated listing is one entry: %q", money)
 	}
@@ -92,7 +88,7 @@ func TestOpenResultReadsOnlyWhatTheSearchShowed(t *testing.T) {
 }
 
 func TestFetchPageRefusesPrivateAddresses(t *testing.T) {
-	for _, u := range []string{"http://127.0.0.1/", "http://localhost/x", "http://192.168.1.1/", "ftp://example.com/", "http://printer.local/"} {
+	for _, u := range []string{"http://127.0.0.1/", "http://localhost/x", "http://192.168.8.1/", "ftp://example.com/", "http://printer.local/"} {
 		if _, err := fetchPage(context.Background(), http.DefaultClient, u); err == nil {
 			t.Errorf("%s should be refused", u)
 		}
@@ -100,7 +96,7 @@ func TestFetchPageRefusesPrivateAddresses(t *testing.T) {
 }
 
 func TestPublicIP(t *testing.T) {
-	private := []string{"127.0.0.1", "::1", "10.1.2.3", "172.16.0.9", "192.168.1.1", "169.254.1.1", "fe80::1", "0.0.0.0", "100.64.0.1", "100.127.255.254", "fc00::1", "224.0.0.1"}
+	private := []string{"127.0.0.1", "::1", "10.1.2.3", "172.16.0.9", "192.168.8.1", "169.254.1.1", "fe80::1", "0.0.0.0", "100.64.0.1", "100.127.255.254", "fc00::1", "224.0.0.1"}
 	public := []string{"8.8.8.8", "1.1.1.1", "100.128.0.1", "2606:4700::1111", "52.94.236.248"}
 	for _, s := range private {
 		if publicIP(net.ParseIP(s)) {

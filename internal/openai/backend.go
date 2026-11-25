@@ -151,7 +151,7 @@ type AskResult struct {
 	ReasoningTokens int
 	CachedTokens    int
 	Truncated       bool
-	CostUSD         *float64 // nil when this model has no verified price table
+	CostUSD         float64
 	Status          string
 }
 
@@ -223,7 +223,6 @@ func (b *Backend) Ask(ctx context.Context, kind, instructions, question string, 
 		"model":  b.Model,
 		"input":  question,
 		"stream": true,
-		"store":  false,
 	}
 	if instructions != "" {
 		payload["instructions"] = instructions
@@ -291,9 +290,8 @@ func (b *Backend) Ask(ctx context.Context, kind, instructions, question string, 
 	// The activity baseline is when the stream became readable, not when the request was sent.
 	err = b.consume(reqCtx, res.Body, t0, tHeaders, out)
 	out.Elapsed = time.Since(t0)
-	if out.Usage() && b.Model == BackendModel {
-		cost := lunaCostUSD(out.InputTokens, out.CachedTokens, out.OutputTokens)
-		out.CostUSD = &cost
+	if out.Usage() {
+		out.CostUSD = lunaCostUSD(out.InputTokens, out.CachedTokens, out.OutputTokens)
 	}
 	// Truncation looks like success: a call can burn its whole budget on invisible reasoning and
 	// stop mid-sentence. Detect it from the status and the token counts, not from text length.
@@ -335,35 +333,20 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 		err error
 	}
 	lines := make(chan line, 64)
-	done := make(chan struct{})
-	defer close(done)
-	send := func(l line) bool {
-		select {
-		case lines <- l:
-			return true
-		case <-done:
-			return false
-		}
-	}
 	// The reader runs in its own goroutine so the watchdog can act while it is blocked on Read.
 	// The HTTP body is closed by the caller's defer, which unblocks this goroutine.
 	go func() {
-		defer close(lines)
 		defer func() {
 			if p := recover(); p != nil {
-				send(line{err: fmt.Errorf("%w: %v", ErrStreamDead, p)})
+				lines <- line{err: fmt.Errorf("%w: %v", ErrStreamDead, p)}
 			}
 		}()
 		sc := bufio.NewScanner(body)
 		sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 		for sc.Scan() {
-			if !send(line{s: sc.Text()}) {
-				return
-			}
+			lines <- line{s: sc.Text()}
 		}
-		if err := sc.Err(); err != nil {
-			send(line{err: err})
-		}
+		lines <- line{err: sc.Err()}
 	}()
 
 	var (
@@ -417,11 +400,8 @@ func (b *Backend) consume(ctx context.Context, body io.Reader, t0, streamStart t
 			if err := expired(); err != nil {
 				return err
 			}
-		case l, ok := <-lines:
+		case l := <-lines:
 			timer.Stop()
-			if !ok {
-				return fmt.Errorf("backend %s: stream ended before completion: %w", b.Model, io.ErrUnexpectedEOF)
-			}
 			if l.err != nil {
 				return fmt.Errorf("backend %s: stream read: %w", b.Model, l.err)
 			}

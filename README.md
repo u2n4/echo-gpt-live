@@ -52,15 +52,13 @@ Echo Dot ──(Alexa cloud)──► AWS Lambda (lambda/index.mjs)
 |---|---|
 | An Echo that supports `Alexa.RTCSessionController` | Tested on Echo Dot 5. Device language English (US); this interface is not offered in Arabic. |
 | Amazon developer account + a Smart Home skill | Discovery advertises one endpoint (CAMERA category by default; `lambda/set-category.sh` switches). |
-| AWS account for the Lambda | Node.js 22+ (`nodejs22.x`), us-east-1 for en-US. `lambda/deploy.sh` creates the role, function and env. |
+| AWS account for the Lambda | Node.js 20+, us-east-1 for en-US. `lambda/deploy.sh` creates the role, function and env. |
 | A Linux host reachable over HTTPS | Only signaling goes through it (a few KB per call). Tailscale Funnel is what this project uses; any HTTPS reverse proxy to `127.0.0.1:8787` works. Media is direct UDP from the host. |
-| Go 1.27.3+ on the host | Pion WebRTC v4. `go build ./...` |
-| An OpenAI API key with access to `gpt-live-1` | Passed via `OPENAI_API_KEY` or stored in `~/.config/acv/openai.key` (never in git). |
+| Go 1.24 on the host | Pion WebRTC v4. `go build ./...` |
+| An OpenAI API key with access to `gpt-live-1` | Stored in a file, never in git or the environment of other processes. |
 
-Cost: `gpt-live-1` is a paid realtime model that bills **$0.05 per minute of wall clock** while a
-session is open, with a 15 s minimum per call. Silence bills at the same rate as speech until the
-session is hung up. The router model (`gpt-4.1-mini`) and free search add a few hundred tokens per
-delegated question.
+Cost: gpt-live-1 bills **$0.05 per minute of wall clock** while a session is open, 15 s minimum.
+The router model and free search add a few hundred tokens per question.
 
 ## Setup
 
@@ -68,7 +66,7 @@ delegated question.
 
 ```bash
 mkdir -p ~/.config/acv && chmod 700 ~/.config/acv
-echo -n 'sk-...'            > ~/.config/acv/openai.key     # OpenAI API key (or set OPENAI_API_KEY)
+echo -n 'sk-...'            > ~/.config/acv/openai.key     # OpenAI API key
 openssl rand -hex 32        > ~/.config/acv/signing.key    # shared HMAC key, also set on the Lambda
 echo 'https://your-host.example.com' > ~/.config/acv/funnel-url   # public HTTPS base URL of the bridge
 chmod 600 ~/.config/acv/*
@@ -78,24 +76,12 @@ chmod 600 ~/.config/acv/*
 
 ```bash
 go build -o bin/bridge ./cmd/bridge          # on the host; or from a workstation: bash scripts/sync.sh <ssh-host>
-cp deploy/bridge.env.example bridge.env      # or copy .env.example; edit flags, place, coordinates, timezone
+cp deploy/bridge.env.example bridge.env      # edit: flags, your place, coordinates, timezone
 mkdir -p ~/.config/systemd/user && cp deploy/bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now bridge
 ```
 
-`scripts/sync.sh <ssh-host>` requires an SSH host argument (there is no default host) and builds
-all binaries under `cmd/*` on that remote Linux host.
-
-Environment variables (`.env.example` and `deploy/bridge.env.example`) configure the bridge and
-keep personal settings out of the code:
-
-- `OPENAI_API_KEY`: OpenAI API key (if not using `--openai-key-file` / `~/.config/acv/openai.key`).
-- `BRIDGE_FLAGS`: CLI flags passed to `bin/bridge` by `deploy/bridge.service`.
-- `BRIDGE_PLACE`: location description included in the assistant prompt (`--place`).
-- `BRIDGE_LAT`, `BRIDGE_LON`: coordinates for the weather and prayer-time tools (`--lat`, `--lon`; `0` disables).
-- `BRIDGE_TIMEZONE`: IANA timezone name (`--timezone`, defaults to host local zone).
-
-Example `bridge.env`:
+`bridge.env` carries everything personal so the code stays generic:
 
 ```
 BRIDGE_FLAGS=--video sendonly --video-fps 1 --idle-close 60s --max-live 10m --daily-budget-usd 2.0 --tools --web-search=free --delegation client
@@ -105,16 +91,10 @@ BRIDGE_LON=0.0
 BRIDGE_TIMEZONE=Asia/Riyadh
 ```
 
-`bin/bridge -h` lists every flag with the measurement behind its default. Notice that `--greeting`
-defaults to empty (off) and should remain off unless testing. Other flags people change:
-`--instructions` (her personality, Gulf Arabic by default), `--farewell` (phrases that end
+`bin/bridge -h` lists every flag with the measurement behind its default. The ones people
+change: `--instructions` (her personality, Gulf Arabic by default), `--farewell` (phrases that end
 the call), `--memory-file`, `--vault-url` + `cmd/vaultd` for notes, `--home-endpoints` for
 read-only things on your LAN, `--record-dir` to keep both audio directions as Ogg/Opus.
-
-The notes service defaults to loopback HTTP. For access from another machine, use
-`vaultd --tls-cert <certificate> --tls-key <private-key>` and an HTTPS `--vault-url`,
-or terminate TLS at a trusted proxy to the loopback service. Non-loopback plaintext
-vault connections and URLs containing embedded credentials are refused.
 
 ### 3. Deploy the Lambda and the skill
 
@@ -123,15 +103,9 @@ aws login --profile alexa-chatgpt-voice --region us-east-1     # or any profile;
 bash lambda/deploy.sh                                          # creates/updates the function and its env
 ```
 
-The Lambda is configured via environment variables:
-- `ACV_UBUNTU_URL`: HTTPS base URL of the bridge (required).
-- `ACV_SIGNING_KEY`: shared HMAC secret matching `signing.key` (required).
-- `ACV_FRIENDLY_NAME`: invocation name shown in the Alexa app (optional, default `"ChatGPT Voice"`).
-- `ACV_ENDPOINT_ID`: stable Alexa endpoint ID (optional, default `"acv-chatgpt-voice-1"`).
-- `ACV_DISPLAY_CATEGORIES`: comma-separated Alexa display categories (optional, default `"CAMERA"`).
-- `ACV_ENDPOINT_HEALTH`: set to `0` to omit the `Alexa.EndpointHealth` capability (optional).
-
-Point your Smart Home skill at the function ARN, enable the skill in the
+The Lambda reads `ACV_UBUNTU_URL` (your HTTPS base URL) and `ACV_SIGNING_KEY` (the same bytes as
+`signing.key`); optional `ACV_FRIENDLY_NAME` (what you say to Alexa), `ACV_ENDPOINT_ID`,
+`ACV_DISPLAY_CATEGORIES`. Point your Smart Home skill at the function ARN, enable the skill in the
 Alexa app, run device discovery, then say **"Alexa, call &lt;friendly name&gt;"**.
 
 ### 4. Prove it without touching the Echo
@@ -176,10 +150,9 @@ beside the live bridge on 8787, because a simulator that reaches the live assist
 
 ```
 cmd/bridge       the service (main.go: flags, call lifecycle; assist.go/confirm.go: delegation + spoken yes/no)
-cmd/answertest   router + tool latency benchmark without opening a live voice call
 cmd/echosim      an Alexa-shaped WebRTC client for tests without an Echo
 cmd/openaitest   one OpenAI live session from the command line, with timing and transcript
-cmd/vaultd       tiny HTTPS agent (loopback HTTP allowed) for notes search + append
+cmd/vaultd       tiny HTTP agent that serves your notes folder to the bridge (search + append)
 cmd/rtcdiag      the original Echo-side experiment harness
 internal/bridge  Pion peer for the Echo (peer.go), the OpenAI leg (liveleg.go), hold/pacer/sequence rebase, farewell detector, recording
 internal/openai  live session client, sideband websocket, budget, ledger, router model
@@ -189,6 +162,7 @@ internal/alexa   HMAC-signed signaling server
 lambda/          the Alexa Smart Home Lambda and its deploy script
 deploy/          systemd unit and a sample env file
 scripts/         sync/build, preflight, prove, call reports, log followers
+docs/            decisions, research and measurements that led here
 ```
 
 ## Privacy
@@ -199,7 +173,4 @@ edit. Search queries go to the free search backends; the voice goes to OpenAI.
 
 ## Status
 
-Measured and used daily on one Echo Dot 5. In the 2026-11-05 public-readiness refresh, Go and Pion
-dependencies were updated and verified with offline unit tests (`go test -count=1 ./...`),
-`go vet ./...`, and `govulncheck ./...`; **it was not tested live against an Echo or OpenAI after
-this refresh**. Released under the MIT License (`LICENSE`).
+Works daily on one Echo Dot 5 in one house. No license file yet; ask before redistributing.

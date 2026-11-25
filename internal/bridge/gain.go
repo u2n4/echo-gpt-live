@@ -19,36 +19,45 @@ import (
 )
 
 const (
-	agcSampleRate  = 48000
-	agcTargetDBFS  = -16.0
-	agcGateDBFS    = -50.0
-	agcMaxGainCap  = 24.0
-	agcAttack      = 0.35 // ~50 ms at 20 ms frames: catches the first syllable of a far speaker
-	agcRelease     = 0.05 // ~400 ms decay: avoids pumping between syllables
-	agcFastDecay   = 0.65 // fast pull-down when a close speaker interrupts loudly
-	agcHPFAlpha    = 0.989 // ~85 Hz 1st-order high-pass at 48 kHz (removes AC/fan rumble)
+	agcSampleRate      = 48000
+	agcTargetDBFS      = -16.0
+	agcGateDBFS        = -50.0
+	agcMaxGainCap      = 24.0
+	agcAttack          = 0.35  // ~50 ms at 20 ms frames: catches the first syllable of a far speaker
+	agcRelease         = 0.05  // ~400 ms decay: avoids pumping between syllables
+	agcFastDecay       = 0.65  // fast pull-down when a close speaker interrupts loudly
+	agcHPFAlpha        = 0.989 // ~85 Hz 1st-order high-pass at 48 kHz (removes AC/fan rumble)
+	agcNoiseInitDBFS   = -58.0 // quiet room baseline
+	agcNoiseDropAlpha  = 0.15  // fast downward adaptation when TV/noise stops
+	agcNoiseRiseAlpha  = 0.015 // slow upward adaptation (~1.3 s) tracks steady TV/AC without tracking speech bursts
+	agcNoiseMarginDB   = 6.5   // speech must stand at least 6.5 dB above steady room/TV floor to be boosted
+	agcNoisyRoomDBFS   = -45.0 // above this steady floor, the TV or background noise is active
+	agcTVSuppressGain  = 0.45  // gentle -7 dB attenuation of steady TV floor below the speech gate
 )
 
-// MicAGC is a stateful per-call mono 48 kHz adaptive gain controller.
+// MicAGC is a stateful per-call mono 48 kHz adaptive gain controller with an adaptive
+// room/TV noise-floor tracker so steady TV audio is never amplified into speech volume.
 type MicAGC struct {
-	maxGain float64
-	gain    float64
-	hpPrevX float64
-	hpPrevY float64
+	maxGain   float64
+	gain      float64
+	noiseDBFS float64
+	hpPrevX   float64
+	hpPrevY   float64
 }
 
-// NewMicAGC creates an AGC with the given maximum boost in dB (e.g. 18 dB = ~8x).
+// NewMicAGC creates an AGC with the given maximum boost in dB (e.g. 12 dB = 4x).
 // Values <= 0 disable boosting (unity gain).
 func NewMicAGC(maxBoostDB float64) *MicAGC {
 	if maxBoostDB <= 0 {
-		return &MicAGC{maxGain: 1.0, gain: 1.0}
+		return &MicAGC{maxGain: 1.0, gain: 1.0, noiseDBFS: agcNoiseInitDBFS}
 	}
 	if maxBoostDB > agcMaxGainCap {
 		maxBoostDB = agcMaxGainCap
 	}
 	return &MicAGC{
-		maxGain: math.Pow(10, maxBoostDB/20.0),
-		gain:    1.0,
+		maxGain:   math.Pow(10, maxBoostDB/20.0),
+		gain:      1.0,
+		noiseDBFS: agcNoiseInitDBFS,
 	}
 }
 
@@ -84,12 +93,29 @@ func (a *MicAGC) Process(pcm []int16) float64 {
 		dbfs = 20.0 * math.Log10(rms)
 	}
 
+	// Track steady room/TV background noise floor (minimum-statistics style asymmetric envelope):
+	// drops quickly in silence, rises slowly only during continuous TV/AC background audio.
+	if dbfs < a.noiseDBFS {
+		a.noiseDBFS += agcNoiseDropAlpha * (dbfs - a.noiseDBFS)
+	} else {
+		// Cap upward tracking at -22 dBFS so even a loud TV never completely blocks close speech.
+		target := math.Min(dbfs, -22.0)
+		a.noiseDBFS += agcNoiseRiseAlpha * (target - a.noiseDBFS)
+	}
+
+	dynamicGate := agcGateDBFS
+	if g := a.noiseDBFS + agcNoiseMarginDB; g > dynamicGate {
+		dynamicGate = g
+	}
+
 	// Decide desired gain:
-	// - Below the noise gate (-50 dBFS): let gain decay back to 1.0 so empty room noise is never boosted.
-	// - Above the gate: lift quiet/far-field speech smoothly toward -16 dBFS, capped by maxGain and
-	//   headroom so peaks stay below clipping.
+	// - Above the dynamic gate (human speech standing out over room/TV floor): boost smoothly
+	//   toward -16 dBFS, capped by maxGain and peak headroom.
+	// - Below the dynamic gate in a noisy room (TV playing): gently attenuate (-7 dB) instead of
+	//   boosting so OpenAI's ASR hears the human voice clearly instead of transcribing TV actors.
+	// - Below the gate in a quiet room: hold unity gain (1.0) so silence stays untouched.
 	desired := 1.0
-	if dbfs > agcGateDBFS {
+	if dbfs > dynamicGate {
 		neededDB := agcTargetDBFS - dbfs
 		if neededDB > 0 {
 			desired = math.Pow(10, neededDB/20.0)
@@ -103,20 +129,26 @@ func (a *MicAGC) Process(pcm []int16) float64 {
 				desired = 1.0
 			}
 		}
+	} else if a.noiseDBFS > agcNoisyRoomDBFS {
+		desired = agcTVSuppressGain
 	}
 
-	// Smooth gain transitions: fast pull-down on sudden loud speech, snappy lift on far speech,
-	// gentle decay back to unity during silence.
+	// Smooth gain transitions: fast pull-down on sudden loud speech, snappy lift on speech,
+	// gentle release during silence or TV floor suppression.
 	alpha := agcRelease
 	if desired > a.gain {
 		alpha = agcAttack
-	} else if dbfs > agcGateDBFS && desired < a.gain {
+	} else if dbfs > dynamicGate && desired < a.gain {
 		alpha = agcFastDecay
 	}
 	prevGain := a.gain
 	a.gain += alpha * (desired - a.gain)
-	if a.gain < 1.0 {
-		a.gain = 1.0
+	minGain := agcTVSuppressGain
+	if a.noiseDBFS <= agcNoisyRoomDBFS {
+		minGain = 1.0
+	}
+	if a.gain < minGain {
+		a.gain = minGain
 	}
 
 	// Pass 2: linearly interpolate gain across the frame to avoid click artifacts at frame edges,

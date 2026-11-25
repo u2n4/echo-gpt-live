@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 )
@@ -118,6 +119,68 @@ func TestSaveIsAtomic(t *testing.T) {
 		if strings.Contains(e.Name(), ".tmp") {
 			t.Errorf("a temporary file was left behind: %s", e.Name())
 		}
+	}
+}
+
+func TestArchiveSurvivesEvictionAndSearchesArabic(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "memory.md")
+	m, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RememberCategorized("family_names", "اسم بنت أختي سارة وتحب القهوة العربية"); err != nil {
+		t.Fatal(err)
+	}
+	// Fill past maxFacts so the oldest active fact is evicted from memory.md
+	for i := 0; i < maxFacts+5; i++ {
+		_ = m.Remember("معلومة إضافية رقم " + itoa(i))
+	}
+	if len(m.Facts()) != maxFacts {
+		t.Fatalf("active facts = %d, want %d", len(m.Facts()), maxFacts)
+	}
+	// Reload from disk and search the archive for the evicted Arabic fact
+	reloaded, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := reloaded.Search("ساره", 5)
+	if len(hits) == 0 || !strings.Contains(hits[0], "سارة") {
+		t.Fatalf("evicted fact was not found in archive search: %v", hits)
+	}
+	// ForgetMatching removes from both active and archive
+	removed, err := reloaded.ForgetMatching("ساره")
+	if err != nil || len(removed) == 0 {
+		t.Fatalf("ForgetMatching failed: removed=%v err=%v", removed, err)
+	}
+	if hits2 := reloaded.Search("سارة", 5); len(hits2) != 0 {
+		t.Fatalf("forgotten fact still found: %v", hits2)
+	}
+}
+
+func TestConcurrentRememberIsSafe(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "memory.md")
+	m, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := m.RememberCategorized("family_names", "اسم قريب رقم "+itoa(i)); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent RememberCategorized failed: %v", err)
+	}
+	if len(m.Facts()) != 10 {
+		t.Fatalf("facts = %d, want 10", len(m.Facts()))
 	}
 }
 

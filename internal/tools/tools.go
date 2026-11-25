@@ -60,6 +60,12 @@ type Tool struct {
 	// Params is a JSON Schema object for the arguments. Nil means the tool takes none.
 	Params map[string]any
 	Access Access
+	// ConfirmWhen optionally narrows when a Write tool requires spoken confirmation. When nil,
+	// Access == Write always requires confirmation. When set, confirmation is required only when
+	// ConfirmWhen(args) returns true (e.g. clearing a whole list, while adding an item runs at once).
+	ConfirmWhen func(args map[string]any) bool
+	// Describe optionally formats a short, spoken-friendly description of a pending confirmation.
+	Describe func(args map[string]any) string
 	// Ambient marks a tool that is cheap, local, takes no arguments, and answers something he asks
 	// often. These are run BEFORE the model is asked anything and their answers are handed to it up
 	// front, which removes a whole model round trip from the questions he actually asks: the first
@@ -68,6 +74,11 @@ type Tool struct {
 	// Only put a tool here if it is fast and free. It runs on every delegation, including the ones
 	// that turn out to be about the capital of France.
 	Ambient bool
+	// DirectReturn marks an action tool whose output is already a crisp, ready-to-speak sentence.
+	// When a model round invokes ONLY DirectReturn tools and every call succeeds, the answerer
+	// returns their output immediately without paying for another LLM round (cuts TV latency in half
+	// and prevents spurious follow-up web searches on background TV dialogue).
+	DirectReturn bool
 	// Timeout bounds the silence. Past it the tool is abandoned and the assistant says so.
 	Timeout time.Duration
 	// Run answers in ONE OR TWO SENTENCES, because the answer is spoken aloud and is capped at 500
@@ -227,8 +238,18 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string, confir
 			return "", fmt.Errorf("%s: arguments were not valid JSON: %w", name, err)
 		}
 	}
-	if t.Access == Write && !confirmed {
-		return "", &ErrNeedsConfirmation{Tool: name, Args: rawArgs, What: describe(name, args)}
+	needsConfirm := t.Access == Write
+	if needsConfirm && t.ConfirmWhen != nil {
+		needsConfirm = t.ConfirmWhen(args)
+	}
+	if needsConfirm && !confirmed {
+		what := describe(name, args)
+		if t.Describe != nil {
+			if custom := strings.TrimSpace(t.Describe(args)); custom != "" {
+				what = custom
+			}
+		}
+		return "", &ErrNeedsConfirmation{Tool: name, Args: rawArgs, What: what}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, t.Timeout)
@@ -256,13 +277,6 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string, confir
 	case <-done:
 		return out, err
 	case <-ctx.Done():
-		// A completed write must not be reported as failed just because its deadline
-		// became ready in the same select. done also publishes out and err safely.
-		select {
-		case <-done:
-			return out, err
-		default:
-		}
 		return "", fmt.Errorf("%w: %s", ErrToolTimeout, name)
 	}
 }

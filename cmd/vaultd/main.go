@@ -17,7 +17,7 @@
 //
 // Usage:
 //
-//	vaultd --vault <vault-directory> --listen :8791 --key-file <file> --tls-cert <cert> --tls-key <key>
+//	vaultd --vault "C:\Users\you\ObsidianVault" --listen 0.0.0.0:8791 --key-file <file>
 package main
 
 import (
@@ -27,7 +27,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -56,19 +55,12 @@ type hit struct {
 func main() {
 	var (
 		vault   = flag.String("vault", os.ExpandEnv("$USERPROFILE\\ObsidianVault"), "the vault directory")
-		listen  = flag.String("listen", "127.0.0.1:8791", "address to serve on; non-loopback requires TLS")
-		tlsCert = flag.String("tls-cert", "", "TLS certificate for LAN access")
-		tlsKey  = flag.String("tls-key", "", "TLS private key for LAN access")
+		listen  = flag.String("listen", "0.0.0.0:8791", "address to serve on; the LAN, not the internet")
 		keyFile = flag.String("key-file", "", "file holding the shared secret; required")
 		inbox   = flag.String("inbox", "00-inbox", "folder inside the vault where spoken notes land")
 		maxHits = flag.Int("max-hits", 5, "how many matches to return")
 	)
 	flag.Parse()
-	host, _, listenErr := net.SplitHostPort(*listen)
-	loopback := host == "localhost" || net.ParseIP(host).IsLoopback()
-	if listenErr != nil || ((*tlsCert == "" || *tlsKey == "") && !loopback) || ((*tlsCert == "") != (*tlsKey == "")) {
-		log.Fatal("vaultd: use loopback HTTP or supply both --tls-cert and --tls-key")
-	}
 
 	if *keyFile == "" {
 		fmt.Fprintln(os.Stderr, "vaultd: --key-file is required; an open endpoint into his notes is not acceptable")
@@ -126,7 +118,7 @@ func main() {
 		}
 		hits, err := search(r.Context(), *vault, q, *maxHits)
 		if err != nil {
-			http.Error(w, "search failed", http.StatusInternalServerError)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, hits)
@@ -147,7 +139,7 @@ func main() {
 		}
 		rel, err := appendNote(*vault, *inbox, body.Text)
 		if err != nil {
-			http.Error(w, "append failed", http.StatusInternalServerError)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, map[string]string{"path": rel})
@@ -158,9 +150,6 @@ func main() {
 		Addr:              *listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-	}
-	if *tlsCert != "" {
-		log.Fatal(srv.ListenAndServeTLS(*tlsCert, *tlsKey))
 	}
 	log.Fatal(srv.ListenAndServe())
 }
@@ -274,37 +263,30 @@ func search(ctx context.Context, root, q string, max int) ([]hit, error) {
 // appendNote adds one line to today's inbox note, creating it if it does not exist. It cannot touch
 // any other file, because the name is built from the date and nothing in the request.
 func appendNote(root, inbox, text string) (string, error) {
-	if !filepath.IsLocal(inbox) {
-		return "", fmt.Errorf("inbox must be inside the vault")
-	}
-	vr, err := os.OpenRoot(root)
-	if err != nil {
+	dir := filepath.Join(root, inbox)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	defer vr.Close()
-	if err := vr.MkdirAll(inbox, 0o755); err != nil {
+	// A date-generated filename stops the REQUEST from naming a path. It does not stop the
+	// FILESYSTEM from redirecting one: an inbox that is a junction, or today's note that is a link,
+	// sends the append wherever the link points. The name being safe is not the same as the write
+	// being confined, so the confinement is checked here rather than assumed.
+	if err := insideRoot(root, dir); err != nil {
 		return "", err
 	}
 	name := "voice-" + time.Now().Format("2006-01-02") + ".md"
-	path := filepath.Join(inbox, name)
-	if st, err := vr.Lstat(path); err == nil && !st.Mode().IsRegular() {
+	full := filepath.Join(dir, name)
+	if st, err := os.Lstat(full); err == nil && !st.Mode().IsRegular() {
 		return "", fmt.Errorf("today's note is not a regular file; refusing to write through it")
 	}
 
-	// Root resolves every path component without allowing a concurrent link swap to escape.
-	f, err := vr.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(full, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil || !st.Mode().IsRegular() {
-		return "", fmt.Errorf("note must be a regular file")
-	}
-	if st.Size() == 0 {
-		if _, err := fmt.Fprintf(f, "# Spoken notes, %s\n\n", time.Now().Format("2006-01-02")); err != nil {
-			return "", err
-		}
+	if st, err := f.Stat(); err == nil && st.Size() == 0 {
+		fmt.Fprintf(f, "# Spoken notes, %s\n\n", time.Now().Format("2006-01-02"))
 	}
 	line := strings.Join(strings.Fields(text), " ")
 	if _, err := fmt.Fprintf(f, "- %s — %s\n", time.Now().Format("15:04"), line); err != nil {
@@ -313,7 +295,8 @@ func appendNote(root, inbox, text string) (string, error) {
 	return filepath.ToSlash(filepath.Join(inbox, name)), nil
 }
 
-// insideRoot resolves links for the read-only search walk. Appends use os.Root.
+// insideRoot resolves every link on both paths and checks that one really is under the other. It is
+// the check that os.Root would make for us on a newer toolchain; this host is on Go 1.22.
 func insideRoot(root, path string) error {
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -353,9 +336,6 @@ func humanAgo(t time.Time) string {
 		return ""
 	}
 	d := time.Since(t)
-	if d < 0 {
-		return "just now"
-	}
 	switch {
 	case d < time.Hour:
 		return fmt.Sprintf("%.0f minutes ago", d.Minutes())

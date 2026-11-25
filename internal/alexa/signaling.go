@@ -79,9 +79,6 @@ func (s *Server) event(ev string, kv ...any) {
 }
 
 func (s *Server) verify(ts string, body []byte, sig string) error {
-	if len(s.key) == 0 {
-		return ErrBadSignature
-	}
 	tsf, err := strconv.ParseFloat(ts, 64)
 	if err != nil {
 		return ErrBadTimestamp
@@ -148,7 +145,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodPost || (path != "/rtc/offer" && path != "/rtc/connected" && path != "/rtc/disconnected") {
-		path = "unknown" // never log arbitrary unauthenticated path contents
 		reply(404, map[string]any{"error": "not_found"})
 		return
 	}
@@ -182,13 +178,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(400, map[string]any{"error": "bad_session_id"})
 		return
 	}
-	if req.Type != strings.TrimPrefix(path, "/rtc/") {
-		reply(400, map[string]any{"error": "bad_type"})
-		return
-	}
 	nonce := req.Nonce
 	if nonce == "" {
-		nonce = strings.ToLower(sig)
+		nonce = sig
 	}
 	if s.seenNonce(nonce) {
 		reply(409, map[string]any{"error": "replay"})

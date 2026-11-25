@@ -32,7 +32,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -232,76 +231,6 @@ type liveCreateResponse struct {
 	} `json:"error"`
 }
 
-// ErrSessionCreated marks a failed setup that already incurred a session charge.
-// Callers must not fall back to creating another paid session, even after cleanup.
-var ErrSessionCreated = errors.New("paid session was already created")
-
-// recoveredLiveID reads the session object even when the rest of the JSON was cut
-// short. A complete string token at .session.id is enough; neither enclosing
-// object needs to finish. The decoder rejects an unterminated string or escape.
-func recoveredLiveID(raw []byte) string {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
-		return ""
-	}
-	for d.More() {
-		key, err := d.Token()
-		if err != nil {
-			return ""
-		}
-		if key == "session" {
-			if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
-				return ""
-			}
-			for d.More() {
-				key, err := d.Token()
-				if err != nil {
-					return ""
-				}
-				if key == "id" {
-					tok, err := d.Token()
-					if err != nil {
-						return ""
-					}
-					id, _ := tok.(string)
-					return id
-				}
-				var skip json.RawMessage
-				if d.Decode(&skip) != nil {
-					return ""
-				}
-			}
-			return ""
-		}
-		var skip json.RawMessage
-		if d.Decode(&skip) != nil {
-			return ""
-		}
-	}
-	return ""
-}
-
-// closeRecoveredSession persists the ID before cleanup and counts the committed
-// init charge. Failed cleanup leaves the ledger entry for the next sweep.
-func (c *LiveClient) closeRecoveredSession(id string, cause error) error {
-	var ledgerErr error
-	if c.Ledger != nil {
-		ledgerErr = c.Ledger.Add(id)
-	}
-	budgetErr := c.Budget.Opened()
-	hctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	hangupErr := c.HangupRetry(hctx, id, 3)
-	if hangupErr == nil {
-		if c.Ledger != nil {
-			c.Ledger.Remove(id)
-		}
-	} else {
-		c.event("live_recovered_cleanup_failed", "session_id", id, "err", hangupErr.Error())
-	}
-	return errors.Join(fmt.Errorf("session %s: %w", id, ErrSessionCreated), cause, ledgerErr, budgetErr, hangupErr)
-}
-
 // StorageDenied reports whether an error is the project refusing stored sessions. A project with
 // data persistence disabled (or Zero Data Retention) rejects store:true, and fork depends on it.
 func StorageDenied(err error) bool {
@@ -369,7 +298,7 @@ func (c *LiveClient) CreateSession(ctx context.Context, offerSDP string, cfg Liv
 		c.storeDenied.Store(true)
 		sess, err = c.createOnce(ctx, offerSDP, cfg)
 	}
-	if err != nil && !errors.Is(err, ErrSessionCreated) {
+	if err != nil {
 		c.Budget.Abandon() // nothing was created; the admission goes back
 	}
 	return sess, err
@@ -445,18 +374,12 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
-		if id := recoveredLiveID(raw); id != "" {
-			return nil, c.closeRecoveredSession(id, fmt.Errorf("create live session: %w", err))
-		}
 		return nil, fmt.Errorf("create live session: %w", err)
 	}
 	c.event("live_create_session", "status", res.StatusCode, "ms", time.Since(t0).Milliseconds(),
 		"billed_init_seconds", liveInitBilledSeconds, "bytes", len(raw))
 	var out liveCreateResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		if id := recoveredLiveID(raw); id != "" {
-			return nil, c.closeRecoveredSession(id, fmt.Errorf("create live session: %w", err))
-		}
 		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	if res.StatusCode != http.StatusCreated && res.StatusCode != http.StatusOK {
@@ -470,11 +393,7 @@ func (c *LiveClient) createOnce(ctx context.Context, offerSDP string, cfg LiveSe
 		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	if out.Session.ID == "" || out.Transport.SDP == "" {
-		err := fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
-		if out.Session.ID != "" {
-			return nil, c.closeRecoveredSession(out.Session.ID, err)
-		}
-		return nil, err
+		return nil, fmt.Errorf("create live session: %w", &StatusError{Op: "create live session", Status: res.StatusCode})
 	}
 	// Count the money the moment it is committed, not when the session closes: a process that dies
 	// in between must still leave the cost on the record.
@@ -521,12 +440,11 @@ func (c *LiveClient) recordOpened(sessionID string) error {
 // the official Python SDK's generated API listing as
 // wss://api.openai.com/v1/live/sessions/{session_id}/attach.
 type LiveSideband struct {
-	conn   *websocket.Conn
-	c      *LiveClient
-	id     string
-	seq    int
-	mu     sync.Mutex
-	closed bool // protected by mu; an in-flight dial cannot resurrect a closed sideband
+	conn *websocket.Conn
+	c    *LiveClient
+	id   string
+	seq  int
+	mu   sync.Mutex
 	// lastEvent is when the socket last delivered anything. While audio is flowing to the
 	// session OpenAI announces every chunk of it here, several times a second, so a socket that
 	// says nothing for ten seconds has died the way a TCP connection dies over WiFi: silently,
@@ -574,22 +492,11 @@ func (c *LiveClient) dialSideband(ctx context.Context, sessionID string) (*webso
 // because the transcript is what the idle timer listens to, the bridge hung up on him at 119 s
 // while he was talking.
 func (s *LiveSideband) Reattach(ctx context.Context) error {
-	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if closed {
-		return net.ErrClosed
-	}
 	conn, err := s.c.dialSideband(ctx, s.id)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		_ = conn.CloseNow()
-		return net.ErrClosed
-	}
 	old := s.conn
 	s.conn = conn
 	s.attached.Add(1)
@@ -698,13 +605,7 @@ func (s *LiveSideband) Read(ctx context.Context, onEvent func(typ string, raw []
 }
 
 // Close shuts the sideband socket.
-func (s *LiveSideband) Close() error {
-	s.mu.Lock()
-	s.closed = true
-	conn := s.conn
-	s.mu.Unlock()
-	return conn.Close(websocket.StatusNormalClosure, "bye")
-}
+func (s *LiveSideband) Close() error { return s.current().Close(websocket.StatusNormalClosure, "bye") }
 
 // Hangup ends the session server-side and stops the per-minute clock.
 func (c *LiveClient) Hangup(ctx context.Context, sessionID string) error {
@@ -741,9 +642,6 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 	defer res.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
-		if id := recoveredLiveID(raw); id != "" {
-			return nil, c.closeRecoveredSession(id, fmt.Errorf("fork: %w", err))
-		}
 		c.Budget.Abandon()
 		return nil, fmt.Errorf("fork: %w", err)
 	}
@@ -752,11 +650,16 @@ func (c *LiveClient) Fork(ctx context.Context, sourceID, offerSDP string) (*Live
 	// A 4xx with a well-formed error body parses fine and has no session id; a 2xx with no
 	// answer SDP would be a session that exists and can never connect. Both are failures.
 	if err := json.Unmarshal(raw, &out); err != nil || res.StatusCode >= 300 || out.Session.ID == "" || out.Transport.SDP == "" {
-		if id := recoveredLiveID(raw); id != "" {
-			cause := fmt.Errorf("fork: %w", &StatusError{Op: "fork", Status: res.StatusCode})
-			return nil, c.closeRecoveredSession(id, cause)
-		}
 		c.Budget.Abandon()
+		if out.Session.ID != "" {
+			c.event("live_fork_unusable", "session_id", out.Session.ID, "status", res.StatusCode,
+				"action", "hanging up: created without an answer")
+			hctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if herr := c.HangupRetry(hctx, out.Session.ID, 3); herr != nil {
+				c.event("live_fork_cleanup_failed", "session_id", out.Session.ID, "err", herr.Error())
+			}
+		}
 		if out.Error != nil {
 			return nil, fmt.Errorf("fork: %w", &apiError{
 				Code:    out.Error.Code,

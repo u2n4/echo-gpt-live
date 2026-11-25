@@ -72,6 +72,28 @@ func TestMicAGCNeverClipsLoudCloseSpeech(t *testing.T) {
 	}
 }
 
+func TestMicAGCSuppressesSteadyTVNoiseAndPassesHumanSpeech(t *testing.T) {
+	agc := NewMicAGC(12)
+	// Simulate 3 seconds (150 frames) of steady -34 dBFS TV audio in the room.
+	tvAmp := math.Pow(10, -34.0/20.0) * math.Sqrt2
+	var tvGain float64
+	for i := 0; i < 150; i++ {
+		tvGain = agc.Process(synthSine(tvAmp, 440, 960))
+	}
+	if tvGain >= 0.85 {
+		t.Fatalf("steady TV background should be suppressed below unity, got gain=%.2f", tvGain)
+	}
+	// Now human speaks loudly over the TV (-20 dBFS): gain must jump back up to >= 1.0 cleanly.
+	speechAmp := math.Pow(10, -20.0/20.0) * math.Sqrt2
+	var speechGain float64
+	for i := 0; i < 6; i++ {
+		speechGain = agc.Process(synthSine(speechAmp, 440, 960))
+	}
+	if speechGain < 1.0 {
+		t.Fatalf("human speech over TV should not stay attenuated, got gain=%.2f", speechGain)
+	}
+}
+
 func TestMicAGCZeroDisablesBoost(t *testing.T) {
 	agc := NewMicAGC(0)
 	frame := synthSine(0.01, 440, 960)

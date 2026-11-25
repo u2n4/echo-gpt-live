@@ -1,15 +1,9 @@
 package openai
 
-// Deciding what was worth remembering, after the call has ended.
-//
-// This is the half of memory that costs something, and the whole point of the design is WHEN it
-// runs: after the hangup, after the billing has stopped, with nobody listening. He is never waiting
-// on it. If it takes ten seconds, or fails, or the machine is rebooted in the middle, the only
-// consequence is that one conversation did not teach it anything.
-//
-// It rewrites the WHOLE profile rather than appending to it. Appending is how a memory fills with
-// "he asked about the weather" forty times; rewriting lets it merge, correct and drop, which is
-// what a person's memory of someone actually does.
+// Learning from a call after it has ended, building a strong two-layer household memory:
+//   - facts: up to 80 concise, categorized facts kept in active memory (injected every call)
+//   - archive: extra specific details (names, item spots, anecdotes, dates) saved into the
+//     unlimited searchable archive so nothing important is ever forgotten.
 
 import (
 	"context"
@@ -20,38 +14,42 @@ import (
 	"time"
 )
 
-// reflectSystem is deliberately strict about what deserves to survive. Everything it keeps is
-// injected into every future call, so a fact that is not worth reading a hundred times is not worth
-// keeping once.
-const reflectSystem = `You keep a small profile of one person, used by a voice assistant in his home.
+const reflectSystem = `You maintain a strong, well-organized two-layer family memory for a voice assistant in a family home.
 
-You are given the profile as it stands and a transcript of the conversation that just ended.
-Return the profile as it SHOULD stand now.
+You are given the current active memory list and a transcript of what the family said in the conversation that just ended.
+Return the updated active memory ("facts", up to 80 items) AND any additional detail notes worth preserving in the long-term searchable archive ("archive").
 
-Keep a fact only if it will still matter in a month:
-- who he is, what he does, who is in the house
-- what he is working on, and what he has decided
-- how he wants to be spoken to
-- preferences, constraints, things he dislikes being asked twice
+Capture and keep EVERYTHING genuinely useful for the household:
+- [أسماء وعائلة] Names and relationships of every family member, child, grandchild, sibling, relative, neighbor, friend, doctor, or teacher mentioned.
+- [أماكن وأشياء] Where items, keys, documents, medicines, tools, or household things are kept ("مفتاح المخزن في الدرج الثاني").
+- [تفضيلات] Favorite foods, drinks, dietary needs, allergies, favorite TV channels/shows/reciters/scholars, speaking style preferences.
+- [صحة وأدوية] Medicines, health notes, recurring appointments, doctor names and clinics.
+- [مواعيد ومناسبات] Birthdays, anniversaries, recurring schedules, important family events.
+- [عام] Any other personal, practical, or household fact they mentioned wanting remembered or likely to ask about later.
 
 Never keep:
-- anything he asked once out of passing curiosity (the weather, a score, a price)
-- what the assistant said
-- anything already implied by another fact
-- anything about this single conversation that will not outlive it
+- Passing one-off queries (today's weather, a one-time price check, random trivia, TV remote button clicks like "يمين / تحت / ميوت").
+- What the assistant said.
+- Exact duplicates.
 
-Correct a fact that the conversation contradicts, and drop one it makes obsolete. Merge duplicates.
-Write each fact as one short sentence in the language he speaks. Fewer is better; an empty-handed
-conversation is normal and you should then return the profile unchanged.
+Rules:
+- Preserve existing valid facts! Only drop or update a fact if the new conversation clearly corrects or supersedes it.
+- Prefix each active fact with its short Arabic category tag when clear: [أسماء وعائلة], [أماكن وأشياء], [تفضيلات], [صحة وأدوية], [مواعيد ومناسبات], or [عام].
+- Write each fact as one clear, short sentence in Arabic (or the language used).
+- If the conversation had nothing worth remembering (e.g., just weather or TV clicks), return the existing facts unchanged and an empty archive list.
 
-Answer with JSON only: {"facts": ["...", "..."]}`
+Answer with JSON only: {"facts": ["...", "..."], "archive": ["..."]}`
 
-// Reflect reads a finished conversation and returns the profile as it should now stand. An error
-// means nothing is changed, which is the right failure: a memory that rewrites itself badly is
-// worse than one that did not update.
+// Reflect reads a finished conversation and returns the updated active facts.
 func (a *Answerer) Reflect(ctx context.Context, facts []string, transcript string) ([]string, error) {
+	core, _, err := a.ReflectFull(ctx, facts, transcript)
+	return core, err
+}
+
+// ReflectFull returns both the updated active profile facts and any extra archive notes.
+func (a *Answerer) ReflectFull(ctx context.Context, facts []string, transcript string) ([]string, []string, error) {
 	if strings.TrimSpace(transcript) == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -62,21 +60,31 @@ func (a *Answerer) Reflect(ctx context.Context, facts []string, transcript strin
 	}
 
 	t0 := time.Now()
+	rmodel := strings.TrimSpace(a.ReflectModel)
+	if rmodel == "" {
+		rmodel = a.model()
+	}
 	body := map[string]any{
-		"model": a.model(),
+		"model": rmodel,
 		"input": []any{
 			map[string]any{"role": "system", "content": reflectSystem},
-			map[string]any{"role": "user", "content": "The profile as it stands:\n" + known +
-				"\n\nThe conversation that just ended:\n" + transcript},
+			map[string]any{"role": "user", "content": "Current active household memory:\n" + known +
+				"\n\nTranscript of the conversation that just ended:\n" + transcript},
 		},
-		// Reasoning is billed against this cap and spent before the answer. At the model's default
-		// effort the first real call thought for 1,984 tokens of a 2,000 cap and returned no text at
-		// all (reflect_unparsable chars=0). Nobody is waiting for this, so the cap is generous, and
-		// the effort is low because deciding what to keep about one conversation is not hard.
 		"max_output_tokens": 8000,
 	}
-	if !a.noReasoningField.Load() {
-		body["reasoning"] = map[string]any{"effort": "low"}
+	reffort := strings.TrimSpace(a.ReflectEffort)
+	if reffort == "" {
+		if strings.HasPrefix(rmodel, "gpt-6.2-sol") {
+			reffort = "high"
+		} else {
+			reffort = "low"
+		}
+	}
+	if reffort != "off" && !strings.HasPrefix(rmodel, "gpt-4.1") && !strings.HasPrefix(rmodel, "gpt-4o") && !strings.Contains(rmodel, "nano") && !a.noReasoningField.Load() {
+		body["reasoning"] = map[string]any{"effort": reffort}
+	} else if strings.HasPrefix(rmodel, "gpt-5.4-nano") {
+		body["reasoning"] = map[string]any{"effort": "none"}
 	}
 	out, err := a.post(ctx, body)
 	var ae *apiError
@@ -86,7 +94,7 @@ func (a *Answerer) Reflect(ctx context.Context, facts []string, transcript strin
 		out, err = a.post(ctx, body)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if out.Status == "incomplete" {
 		reason := "unknown"
@@ -94,7 +102,7 @@ func (a *Answerer) Reflect(ctx context.Context, facts []string, transcript strin
 			reason = out.IncompleteDetails.Reason
 		}
 		a.event("reflect_incomplete", "reason", reason, "out_tokens", out.Usage.OutputTokens)
-		return nil, fmt.Errorf("reflection was cut off (%s)", reason)
+		return nil, nil, fmt.Errorf("reflection was cut off (%s)", reason)
 	}
 
 	var text string
@@ -107,22 +115,21 @@ func (a *Answerer) Reflect(ctx context.Context, facts []string, transcript strin
 			text += c.Text
 		}
 	}
-	// The model was asked for JSON and mostly obliges, but a fence or a sentence in front of it is
-	// not a reason to throw the whole conversation away.
 	if i := strings.Index(text, "{"); i >= 0 {
 		if j := strings.LastIndex(text, "}"); j > i {
 			text = text[i : j+1]
 		}
 	}
 	var parsed struct {
-		Facts []string `json:"facts"`
+		Facts   []string `json:"facts"`
+		Archive []string `json:"archive"`
 	}
 	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
 		a.event("reflect_unparsable", "chars", len(text))
-		return nil, err
+		return nil, nil, err
 	}
 	a.event("reflect_done", "ms", time.Since(t0).Milliseconds(),
-		"was", len(facts), "now", len(parsed.Facts),
+		"was", len(facts), "now", len(parsed.Facts), "archived", len(parsed.Archive),
 		"in_tokens", out.Usage.InputTokens, "out_tokens", out.Usage.OutputTokens)
-	return parsed.Facts, nil
+	return parsed.Facts, parsed.Archive, nil
 }

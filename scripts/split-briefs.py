@@ -18,25 +18,11 @@ Read `docs/EVIDENCE-audio-quality.md` in it first. Everything measured is there.
 
 
 def main(plan, outdir, root):
-    with open(plan, encoding="utf-8") as f:
-        src = f.read()
+    src = open(plan, encoding="utf-8").read()
     os.makedirs(outdir, exist_ok=True)
 
     # split on the top-level BRIEF headings
-    parts, current, fence = [], [], None
-    for line in src.splitlines(keepends=True):
-        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-        if marker:
-            token = marker.group(1)
-            if fence is None:
-                fence = token
-            elif token[0] == fence[0] and len(token) >= len(fence):
-                fence = None
-        if fence is None and line.startswith("## BRIEF "):
-            parts.append("".join(current))
-            current = []
-        current.append(line)
-    parts.append("".join(current))
+    parts = re.split(r"\n(?=## BRIEF )", src)
     written = []
     for part in parts:
         m = re.match(r"## BRIEF ([A-Z]\d+)\b", part)

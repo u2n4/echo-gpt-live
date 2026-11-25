@@ -18,7 +18,6 @@
 # Usage: scripts/speaker-test.sh   then say "Alexa, talk to the intercom" and stay quiet.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
-source "$ROOT/scripts/lib/safe-port.sh"
 REC="$HOME/.local/state/rtcdiag/speaker-test"
 SWEEP="media/sweep_18s.ogg"
 [ -f "$SWEEP" ] || { echo "missing $SWEEP" >&2; exit 1; }
@@ -28,7 +27,9 @@ SWEEP="media/sweep_18s.ogg"
 # assistant unable to bind and the user without an assistant.
 RD=""
 restore() {
-  stop_child "$RD"
+  [ -n "$RD" ] && kill -INT "$RD" 2>/dev/null
+  sleep 1
+  [ -n "$RD" ] && kill -9 "$RD" 2>/dev/null
   echo
   echo "restoring the assistant"
   systemctl --user start bridge
@@ -58,13 +59,15 @@ echo
 
 for _ in $(seq 1 180); do
   sleep 1
-  if ! kill -0 "$RD" 2>/dev/null; then break; fi
+  if [ -s "$REC"/*/from-echo.ogg ] 2>/dev/null; then
+    if ! kill -0 $RD 2>/dev/null; then break; fi
+  fi
   if grep -q '"ev":"alexa_session_disconnected"' "runs/$RUN/events.jsonl" 2>/dev/null; then
     sleep 5
     break
   fi
 done
-stop_child "$RD"
+kill -INT $RD 2>/dev/null; wait $RD 2>/dev/null
 RD=""
 
 F="$(find "$REC" -name from-echo.ogg | head -1)"

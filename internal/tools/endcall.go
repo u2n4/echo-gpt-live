@@ -44,8 +44,9 @@ func (*ErrCallEnding) Error() string { return "the call is ending" }
 // only when the call, the line or the connection is its object (so "السكر" and "الخط" in a
 // sentence about sugar or handwriting are not). "خلاص" and "شكرا" are deliberately absent.
 var farewellRE = regexp.MustCompile(
-	`مع السلام|(^| )سلام( |$)|يلا سلام|باي|يحفظك|علي خير|امان الله|اللقاء|كلمك بعدين|` +
+	`مع السلام|(^| )سلام( |$)|يلا سلام|باي|يحفظك|علي خير|امان الله|فمان الله|فرمان الله|اللقاء|كلمك بعدين|` +
 		`(اقفل|اقفلي|قفل|قفلي|سكر|سكري|انهي|انه|خلص|خلصي)[^ ]* (ال)?(مكالم|اتصال|خط|لاين)|` +
+		`(ابي|ابغي|ابغى|اريد ان) (اقفل|اسكر|اغلق)|` +
 		`(^| )bye|goodbye|good ?night|hang up|end (the|this) call|close (the|this) call|` +
 		`see you|talk to you later|that'?s all|that is all|so long|farewell|take care`)
 

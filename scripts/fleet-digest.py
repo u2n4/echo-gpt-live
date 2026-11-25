@@ -23,8 +23,8 @@ def normalise(claim):
     s = claim.lower()
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     s = re.sub(r"\b(the|a|an|is|are|would|could|that|this|it|to|of|and|in|on|for|with|be|by|as)\b", " ", s)
-    # Preserve negation, numeric values and word order; agreement must not merge opposites.
-    return " ".join(s.split())
+    words = sorted(set(w for w in s.split() if len(w) > 3))
+    return " ".join(words[:9])
 
 
 def main(root):

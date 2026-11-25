@@ -1,0 +1,22 @@
+[Unit]
+Description=tvd - signed local control of the Xiaomi TV box (Alexa Lambda + Sol)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/echo-gpt-live/tvd
+# The pairing (client certificate) made on 2026-10-18 lives here.
+Environment=TVD_CERT_DIR=%h/tv-remote
+# -E -s: ignore PYTHON* env and user site-packages, but keep the script's own directory on
+# sys.path (it imports auth.py and controller.py); -I would drop that too.
+ExecStart=%h/.local/share/tvd/venv/bin/python -E -s %h/echo-gpt-live/tvd/server.py serve
+Restart=always
+RestartSec=3
+UMask=0077
+# It shares the host with the live bridge: a flood on the public /tv path must not take memory
+# from it (measured in normal use: ~40 MB).
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target
