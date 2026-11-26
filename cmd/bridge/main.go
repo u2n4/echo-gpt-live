@@ -1379,6 +1379,7 @@ func main() {
 				ServiceTier: *visionTier,
 				Web:         web,
 				OnActive:    a.remote.Activate,
+				OnEvent:     a.ev,
 			}))
 		}
 		if web != nil {

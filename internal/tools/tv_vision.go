@@ -45,7 +45,8 @@ type TVVisionConfig struct {
 	ServiceTier string       // optional Fast Mode ("fast" or "priority")
 	HTTP        *http.Client // optional
 	Web         *Web         // optional: used for fast Netflix title ID lookup
-	OnActive    func()       // optional: activates fast-path remote mode when done
+	OnEvent     func(string, ...any)
+	OnActive    func() // optional: activates fast-path remote mode when done
 }
 
 type visionStep struct {
@@ -65,7 +66,22 @@ type visionDecision struct {
 }
 
 // TVVision returns the TV Computer-Use tool that sees the screen and controls Netflix/YouTube/TV.
+type timedVisionTV struct {
+	TVDoer
+	event func(string, ...any)
+}
+
+func (t timedVisionTV) Do(ctx context.Context, action string, args map[string]any, budget time.Duration) (tv.Result, error) {
+	began := time.Now()
+	result, err := t.TVDoer.Do(ctx, action, args, budget)
+	t.event("vision_tv_step", "action", action, "ms", time.Since(began).Milliseconds(), "ok", err == nil && result.OK)
+	return result, err
+}
+
 func TVVision(cfg TVVisionConfig) *Tool {
+	if cfg.OnEvent != nil && cfg.Client != nil {
+		cfg.Client = timedVisionTV{cfg.Client, cfg.OnEvent}
+	}
 	if cfg.Model == "" {
 		cfg.Model = "gpt-6.2-sol"
 	}
@@ -203,7 +219,7 @@ func TVVision(cfg TVVisionConfig) *Tool {
 				alreadyOpen := serr == nil && st.OK && appMatchesPackage(app, st.State.App)
 				if !alreadyOpen {
 					if lres, lerr := cfg.Client.Do(ctx, "launch", map[string]any{"app": app}, 7*time.Second); lerr == nil && lres.OK {
-						sleepCtx(ctx, 1100*time.Millisecond)
+						sleepCtx(ctx, 350*time.Millisecond)
 					}
 				}
 			}
@@ -234,7 +250,7 @@ func TVVision(cfg TVVisionConfig) *Tool {
 			if episode != "" {
 				fullGoal += " | الحلقة المطلوبة: " + episode
 			}
-			return runVisionLoop(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, app, fullGoal, query, mode == "last_watched", 5, activate)
+			return runVisionLoop(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, app, fullGoal, query, mode == "last_watched", 5, activate, cfg.OnEvent)
 		},
 	}
 }
@@ -326,7 +342,7 @@ func isPrematureVisionAsk(say string) bool {
 	return false
 }
 
-func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, apiKey, model, effort, serviceTier, app, goal, query string, mustReadResult bool, maxSteps int, onActive func()) (string, error) {
+func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, apiKey, model, effort, serviceTier, app, goal, query string, mustReadResult bool, maxSteps int, onActive func(), onEvent func(string, ...any)) (string, error) {
 	var history []string
 	var lastSay string
 	for step := 0; step < maxSteps; step++ {
@@ -337,7 +353,11 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 		if err != nil {
 			return "ما قدرت أتأكد من مدخل شاشة التلفزيون الحين.", nil
 		}
+		started := time.Now()
 		dec, err := decideVisionStep(ctx, httpClient, apiKey, model, effort, serviceTier, sc.ImageB64, goal, query, history, step+1, maxSteps)
+		if onEvent != nil {
+			onEvent("vision_model_step", "step", step+1, "ms", time.Since(started).Milliseconds(), "ok", err == nil)
+		}
 		if err != nil {
 			if lastSay != "" {
 				return lastSay, nil
@@ -418,7 +438,7 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 					}
 					return "تم، شغّلته على التلفزيون.", nil
 				}
-				sleepCtx(ctx, 450*time.Millisecond)
+				sleepCtx(ctx, 180*time.Millisecond)
 			}
 		case "text":
 			txt := strings.TrimSpace(dec.Text)
@@ -441,7 +461,7 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 					onActive()
 				}
 				history = append(history, fmt.Sprintf("step %d: cleared & typed %q", step+1, txt))
-				sleepCtx(ctx, 1000*time.Millisecond)
+				sleepCtx(ctx, 450*time.Millisecond)
 			}
 		case "launch":
 			if dec.App != "" {
@@ -453,7 +473,7 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 					onActive()
 				}
 				history = append(history, fmt.Sprintf("step %d: launched %s", step+1, dec.App))
-				sleepCtx(ctx, 1100*time.Millisecond)
+				sleepCtx(ctx, 350*time.Millisecond)
 			}
 		case "launch_url":
 			if dec.URL != "" {

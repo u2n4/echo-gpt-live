@@ -87,6 +87,10 @@ func (w *transcriptWindow) add(text string) {
 // Reading and marking happen under ONE lock. They used to be two, and a fragment arriving between
 // them belonged to neither this question nor the next. Codex found it.
 func (w *transcriptWindow) question() string {
+	return w.readQuestion(true)
+}
+
+func (w *transcriptWindow) readQuestion(consume bool) string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	// Bound EVERY question to the recent firstQuestionReach window (15 s) so background TV
@@ -98,7 +102,9 @@ func (w *transcriptWindow) question() string {
 			continue
 		}
 		b.WriteString(p.text)
-		w.taken = p.ord
+		if consume {
+			w.taken = p.ord
+		}
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -182,8 +188,10 @@ type assistant struct {
 	pending  *pendingWrite
 	ev       func(string, ...any)
 	// confirmWithin is how long a spoken yes stays valid.
-	confirmWithin time.Duration
-	inFlight      sync.Mutex // one delegation at a time; the model is waiting for this one
+	confirmWithin     time.Duration
+	delegationMu      sync.Mutex
+	activeDelegation  *delegationWork
+	waitingDelegation bool
 
 	mu     sync.Mutex
 	call   string // the Echo session this conversation belongs to
@@ -444,13 +452,115 @@ type speaker interface {
 	Thinking(ctx context.Context, delegationID, content string) error
 }
 
-// onDelegation answers one delegation and says the result.
-func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID string) {
-	if !a.inFlight.TryLock() {
-		a.ev("delegation_skipped", "reason", "one is already being answered")
+type delegationWork struct {
+	done     chan struct{}
+	cancel   context.CancelFunc
+	question string
+	callCtx  context.Context
+}
+
+func spokenCorrection(text string) bool {
+	text = strings.Map(func(r rune) rune {
+		switch r {
+		case 'أ', 'إ', 'آ':
+			return 'ا'
+		case '،', ',':
+			return ' '
+		}
+		return r
+	}, text)
+	text = strings.Join(strings.Fields(text), " ")
+	for _, prefix := range []string{"لا اقصد", "انا اقصد", "قصدي", "مو قصدي", "لا ابي", "لا ابغى"} {
+		if strings.HasPrefix(text, prefix+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// onDelegation retains one follow-up and acknowledges every delegation while busy.
+func (a *assistant) onDelegation(callCtx context.Context, sb speaker, delegationID string) {
+	if callCtx.Err() != nil {
 		return
 	}
-	defer a.inFlight.Unlock()
+	ctx, cancel := context.WithCancel(callCtx)
+	defer cancel()
+	work := &delegationWork{done: make(chan struct{}), cancel: cancel, callCtx: callCtx}
+	a.delegationMu.Lock()
+	active := a.activeDelegation
+	previousRequest, queuedQuestion := "", ""
+	if active != nil && active.callCtx == callCtx {
+		next := a.window.readQuestion(false)
+		if next == "" {
+			a.delegationMu.Unlock()
+			select {
+			case <-time.After(120 * time.Millisecond):
+			case <-ctx.Done():
+				return
+			}
+			a.delegationMu.Lock()
+			active = a.activeDelegation
+			if active == nil || active.callCtx != callCtx {
+				goto start
+			}
+			next = a.window.readQuestion(false)
+		}
+		correction := spokenCorrection(next)
+		duplicate := next == "" || next == active.question
+		if (duplicate && !correction) || a.waitingDelegation {
+			if next != "" && next == active.question && !a.waitingDelegation {
+				a.window.question()
+			}
+			a.delegationMu.Unlock()
+			a.ev("delegation_busy")
+			a.say(ctx, sb, delegationID, "لحظة، للحين أشتغل على الطلب.")
+			return
+		}
+		a.waitingDelegation = true
+		queuedQuestion = a.window.question()
+		if correction {
+			previousRequest = active.question
+			active.cancel()
+		}
+		a.delegationMu.Unlock()
+		a.ev("delegation_queued", "correction", correction)
+		// The acknowledgement belongs to the call; preserve the delegation for the final answer.
+		a.say(ctx, sb, "", "سمعتك، لحظة.")
+		select {
+		case <-active.done:
+		case <-callCtx.Done():
+		}
+		a.delegationMu.Lock()
+		if a.activeDelegation != active {
+			a.delegationMu.Unlock()
+			return
+		}
+		a.waitingDelegation = false
+		if ctx.Err() != nil {
+			a.activeDelegation = nil
+			a.delegationMu.Unlock()
+			return
+		}
+	}
+start:
+	a.activeDelegation = work
+	a.waitingDelegation = false
+	a.delegationMu.Unlock()
+	defer func() {
+		a.delegationMu.Lock()
+		if a.activeDelegation == work && !a.waitingDelegation {
+			a.activeDelegation = nil
+		}
+		close(work.done)
+		a.delegationMu.Unlock()
+		if ctx.Err() != nil && callCtx.Err() == nil {
+			replyCtx, stop := context.WithTimeout(callCtx, 800*time.Millisecond)
+			defer stop()
+			if err := sb.Thinking(replyCtx, delegationID, "The caller corrected this request. Do not speak or act on it."); err != nil {
+				a.ev("delegation_superseded_reply_failed")
+			}
+		}
+	}()
 
 	_, call := a.current()
 
@@ -471,7 +581,10 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 		}
 	}
 
-	question := a.window.question()
+	question := queuedQuestion
+	if question == "" {
+		question = a.window.question()
+	}
 	// The delegation and the transcript of the words that caused it travel on the same socket but
 	// not in a fixed order. A delegation that arrives a beat before its own words is not one with
 	// nothing to answer; give the words a moment to land.
@@ -498,6 +611,9 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 		return
 	}
 
+	a.delegationMu.Lock()
+	work.question = question
+	a.delegationMu.Unlock()
 	a.ev("delegation_start", "id", delegationID, "chars", len(question))
 	t0 := time.Now()
 
@@ -513,6 +629,9 @@ func (a *assistant) onDelegation(ctx context.Context, sb speaker, delegationID s
 	// question is still only what he just said; the router had no idea what "and tomorrow?" meant.
 	ask := openai.Question{Said: question}
 	ask.PrevQ, ask.PrevA = a.previous()
+	if previousRequest != "" {
+		ask.PrevQ, ask.PrevA = previousRequest, ""
+	}
 
 	answer, err := a.answerer.Answer(ctx, ask)
 	if ctx.Err() != nil {

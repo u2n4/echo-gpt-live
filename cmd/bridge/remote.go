@@ -779,7 +779,11 @@ func (r *remote) Feed(tok uint64, text string) {
 	if r.timer != nil {
 		r.timer.Stop()
 	}
-	r.timer = time.AfterFunc(remoteQuiet, func() { r.flush(tok, seq) })
+	quiet := remoteQuiet
+	if r.active && !r.echo && !r.overflow && !r.chainNeg && instantNavWords[normaliseRemote(r.raw)] {
+		quiet = 90 * time.Millisecond
+	}
+	r.timer = time.AfterFunc(quiet, func() { r.flush(tok, seq) })
 	r.mu.Unlock()
 
 	if streamEv != "" && len(streamCmds) > 0 {
