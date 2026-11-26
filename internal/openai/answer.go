@@ -513,21 +513,36 @@ func (a *Answerer) Answer(ctx context.Context, q Question) (string, error) {
 				if errors.As(cerr, &need) {
 					// Not a failure. The assistant has to ask him first, and this is the sentence.
 					a.event("answer_needs_confirmation", "tool", call.Name)
+					a.event("answer_tool_result", "tool", call.Name, "outcome", "confirmation")
 					return "", cerr
 				}
 				var ending *tools.ErrCallEnding
 				if errors.As(cerr, &ending) {
 					// Not a failure either: he said goodbye. Nothing this model could say next is
 					// worth the round it would take, so the caller gets the signal, not a sentence.
+					a.event("answer_tool_result", "tool", call.Name, "outcome", "ok")
 					a.event("answer_ends_call", "rounds", round+1, "ms", time.Since(started).Milliseconds())
 					return "", cerr
 				}
-				a.event("answer_tool_failed", "tool", call.Name, "err", cerr.Error())
+				reason := "tool_error"
+				var unavailable *tools.SearchUnavailable
+				switch {
+				case errors.As(cerr, &unavailable):
+					reason = unavailable.Error()
+				case errors.Is(cerr, context.Canceled):
+					reason = "canceled"
+				case errors.Is(cerr, tools.ErrToolTimeout), errors.Is(cerr, context.DeadlineExceeded):
+					reason = "timeout"
+				}
+				a.event("answer_tool_result", "tool", call.Name, "outcome", "failed", "reason", reason)
 				result = "That did not work: " + cerr.Error()
-			} else if t, ok := a.Tools.Get(call.Name); ok && t.DirectReturn && strings.TrimSpace(result) != "" {
-				directOut = append(directOut, strings.TrimSpace(result))
 			} else {
-				allDirect = false
+				a.event("answer_tool_result", "tool", call.Name, "outcome", "ok")
+				if t, ok := a.Tools.Get(call.Name); ok && t.DirectReturn && strings.TrimSpace(result) != "" {
+					directOut = append(directOut, strings.TrimSpace(result))
+				} else {
+					allDirect = false
+				}
 			}
 			input = append(input, map[string]any{
 				"type": "function_call_output", "call_id": call.CallID, "output": result,

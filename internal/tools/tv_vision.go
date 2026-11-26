@@ -26,6 +26,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/u2n4/echo-gpt-live/internal/tv"
 )
 
 // tvVisionURL is a variable so tests can point OpenAI Vision calls at a local httptest server.
@@ -261,17 +263,46 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 }
 
 func describeTVScreen(ctx context.Context, client TVDoer, httpClient *http.Client, apiKey, model, effort, serviceTier, goal, app string) (string, error) {
-	sc, err := client.Do(ctx, "screenshot", map[string]any{"max_width": 896, "quality": 7}, 7*time.Second)
-	if err != nil || !sc.OK || sc.ImageB64 == "" {
-		return "", fmt.Errorf("screenshot failed: %v %s", err, sc.Error)
-	}
-	if app != "" && app != "cameras" && sc.Input != "hdmi3" {
-		return "", fmt.Errorf("app input unconfirmed")
+	sc, err := captureTVScreen(ctx, client, app)
+	if err != nil {
+		return "", err
 	}
 	sys := "أنتِ مساعدة صوتية ذكية (أسترا) تشوفين شاشة التلفزيون الحين وتردّين باللهجة الخليجية الدافئة في جملة أو جملتين قصيرتين واضحتين فقط (بدون نقاط ولا تنسيق، وبدون مناداة المستخدم بأي اسم شخصي، وبدون أسئلة متابعة). " +
 		"إذا كانت الشاشة سوداء تماماً فاذكري بلطف إنه الظاهر فيه فيديو محمي (DRM) شغّال أو الشاشة مطفية. " +
 		"إذا ظاهر اسم مسلسل أو فيلم أو صف متابعة المشاهدة أو رقم موسم/حلقة فاذكريه بدقة."
 	return callVisionText(ctx, httpClient, apiKey, model, effort, serviceTier, sys, "سؤال المستخدم: "+goal, sc.ImageB64, 700)
+}
+
+// captureTVScreen requires fresh source evidence from tvd before a frame can leave the bridge.
+func captureTVScreen(ctx context.Context, client TVDoer, app string) (tv.Result, error) {
+	args := map[string]any{"max_width": 896, "quality": 7}
+	required := ""
+	switch app {
+	case "cameras":
+		required = "hdmi2"
+	case "netflix", "youtube", "shahid":
+		required = "hdmi3"
+	}
+	if required != "" {
+		args["required_input"] = required
+	}
+	sc, err := client.Do(ctx, "screenshot", args, 7*time.Second)
+	if err == nil && required == "hdmi3" && sc.Error == "input_mismatch" {
+		sw, switchErr := client.Do(ctx, "switch_input", map[string]any{"input": "xiaomi"}, 9*time.Second)
+		if switchErr != nil || !sw.OK {
+			return tv.Result{}, fmt.Errorf("could not switch to the Xiaomi input")
+		}
+		sleepCtx(ctx, 800*time.Millisecond)
+		sc, err = client.Do(ctx, "screenshot", args, 7*time.Second)
+	}
+	if err != nil || !sc.OK || sc.ImageB64 == "" {
+		return tv.Result{}, fmt.Errorf("screenshot failed: %v %s", err, sc.Error)
+	}
+	if !sc.InputVerified || (required != "" && sc.Input != required) ||
+		(required == "" && sc.Input == "hdmi2") {
+		return tv.Result{}, fmt.Errorf("screenshot source unverified or not requested")
+	}
+	return sc, nil
 }
 
 // isPrematureVisionAsk detects when the Vision model tried to stop mid-task and ask the user
@@ -302,22 +333,9 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 		if ctx.Err() != nil {
 			break
 		}
-		sc, err := client.Do(ctx, "screenshot", map[string]any{"max_width": 896, "quality": 7}, 7*time.Second)
-		if err != nil || !sc.OK || sc.ImageB64 == "" {
-			if lastSay != "" {
-				return lastSay, nil
-			}
-			return "ما قدرت أشوف شاشة التلفزيون الحين.", nil
-		}
-		// Privacy guard: if Huawei TV is currently showing security cameras (hdmi2) and the user
-		// asked for an app (Netflix/YouTube/Shahid), switch back to Xiaomi BEFORE uploading any frame.
-		if sc.Input != "hdmi3" && app != "cameras" && app != "" {
-			if sw, serr := client.Do(ctx, "switch_input", map[string]any{"input": "xiaomi"}, 9*time.Second); serr == nil && sw.OK {
-				history = append(history, fmt.Sprintf("step %d: auto-switched from cameras to xiaomi", step+1))
-				sleepCtx(ctx, 800*time.Millisecond)
-				continue
-			}
-			return "ما قدرت أتأكد إن الشاشة على الشاومي.", nil
+		sc, err := captureTVScreen(ctx, client, app)
+		if err != nil {
+			return "ما قدرت أتأكد من مدخل شاشة التلفزيون الحين.", nil
 		}
 		dec, err := decideVisionStep(ctx, httpClient, apiKey, model, effort, serviceTier, sc.ImageB64, goal, query, history, step+1, maxSteps)
 		if err != nil {

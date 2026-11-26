@@ -20,6 +20,7 @@ import struct
 import tempfile
 import time
 import os
+from pathlib import Path
 
 from controller import TVError
 
@@ -78,6 +79,11 @@ def build_monkey_script(target_index: int) -> str:
     lines.append("UserWait(80)")
     lines.append("DispatchPress(KEYCODE_DPAD_CENTER)")
     return "\n".join(lines) + "\n"
+
+
+# Values read from Huawei's TV service, independent of the input picker card order.
+SOURCE_IDS = {9: "hdmi1", 10: "hdmi2", 11: "hdmi3"}
+INPUT_HELPER = "/data/local/tmp/tvd-huawei-input.dex"
 
 
 class HuaweiTV:
@@ -187,14 +193,42 @@ class HuaweiTV:
             self._log("huawei_switch", input=canonical, index=idx)
             return {"input": canonical, "index": idx}
 
-    async def screenshot(self, max_width: int = 896, quality: int = 7, timeout: float = 6.5) -> dict:
+    async def _read_input(self) -> str:
+        command = (f"test -r {INPUT_HELPER} || exit 44; "
+                   f"CLASSPATH={INPUT_HELPER}:/system/framework/hwtvshare.jar "
+                   "app_process /system/bin HuaweiInput")
+        argv = (self.adb, "-s", self.host)
+        rc, out, _ = await self._exec(*argv, "shell", command, timeout=1.5)
+        if rc == 44:
+            dex = Path(__file__).with_name("huawei-input.dex")
+            if dex.is_file():
+                pushed, _, _ = await self._exec(*argv, "push", str(dex), INPUT_HELPER, timeout=1.5)
+                if pushed == 0:
+                    rc, out, _ = await self._exec(*argv, "shell", command, timeout=1.5)
+        parts = out.split()
+        if rc or len(parts) != 2 or not parts[0].isdigit() or parts[1] != b"0":
+            return "unknown"
+        return SOURCE_IDS.get(int(parts[0]), "unknown")
+
+    async def _check_input(self, required: str) -> str:
+        observed = await self._read_input()
+        if required and observed != required:
+            code = "unverified_input" if observed == "unknown" else "input_mismatch"
+            raise TVError(code, "TV source could not be verified as the requested HDMI input")
+        return observed
+
+    async def screenshot(self, max_width: int = 896, quality: int = 7, timeout: float = 6.5,
+                         required_input: str = "") -> dict:
         """Capture the live TV screen as a compact base64 JPEG (~30-60 KB in ~1.4 s)."""
         max_width = max(320, min(1920, int(max_width or 896)))
         quality = max(2, min(15, int(quality or 7)))
+        if required_input not in ("", "hdmi2", "hdmi3"):
+            raise TVError("bad_request", "unsupported required HDMI input")
         async with self._lock:
             await self._ensure_connected(min(2.0, timeout))
             has_ffmpeg = shutil.which(self.ffmpeg) is not None
             if has_ffmpeg:
+                before = await self._check_input(required_input)
                 rc, raw, err = await self._exec(
                     self.adb, "-s", self.host, "exec-out", "screencap",
                     timeout=max(2.5, timeout - 1.0),
@@ -202,11 +236,13 @@ class HuaweiTV:
                 if rc != 0:
                     self._last_ok_at = 0.0
                     await self._ensure_connected(min(2.0, timeout), force=True)
+                    before = await self._check_input(required_input)
                     rc, raw, err = await self._exec(
                         self.adb, "-s", self.host, "exec-out", "screencap",
                         timeout=max(2.5, timeout - 1.5),
                     )
                 if rc == 0 and len(raw) >= 16:
+                    after = await self._check_input(required_input)
                     self._last_ok_at = time.monotonic()
                     w, h, fmt = struct.unpack("<III", raw[:12])
                     pixel_bytes = w * h * 4
@@ -226,19 +262,23 @@ class HuaweiTV:
                                 "bytes": len(jpg),
                                 "width": w,
                                 "height": h,
-                                "input": self._current_input or "unknown",
+                                "input": before if before == after else "unknown",
+                                "input_verified": before == after and before != "unknown",
                             }
             # Fallback: PNG via screencap -p (bounded to fit within client's 512 KiB JSON limit).
+            before = await self._check_input(required_input)
             rc, png, err = await self._exec(
                 self.adb, "-s", self.host, "exec-out", "screencap", "-p",
                 timeout=max(3.0, timeout),
             )
             if rc != 0 or len(png) < 256:
                 raise TVError("unreachable", f"screencap failed: {err.decode('utf-8', 'replace')[:120]}")
+            after = await self._check_input(required_input)
             if len(png) > 340_000:
                 raise TVError("oversize", "screenshot requires ffmpeg to produce a bounded JPEG")
             return {
                 "image_b64": base64.b64encode(png).decode("ascii"),
                 "bytes": len(png),
-                "input": self._current_input or "unknown",
+                "input": before if before == after else "unknown",
+                "input_verified": before == after and before != "unknown",
             }

@@ -1,0 +1,7 @@
+[Unit]
+Description=Summarize the last 24 hours of Echo bridge health
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 %h/echo-gpt-live/scripts/health-summary.py --output %h/.local/state/rtcdiag/health-summary.json

@@ -48,12 +48,13 @@ type State struct {
 // Result is tvd's answer. OK false with an Error code is a command tvd refused or could not
 // finish (off, unreachable, timeout, busy, bad_request, ...); it is not a transport error.
 type Result struct {
-	OK       bool   `json:"ok"`
-	Error    string `json:"error"`
-	State    State  `json:"state"`
-	ImageB64 string `json:"image_b64,omitempty"`
-	Input    string `json:"input,omitempty"`
-	MS       int    `json:"ms"`
+	OK            bool   `json:"ok"`
+	Error         string `json:"error"`
+	State         State  `json:"state"`
+	ImageB64      string `json:"image_b64,omitempty"`
+	Input         string `json:"input,omitempty"`
+	InputVerified bool   `json:"input_verified,omitempty"`
+	MS            int    `json:"ms"`
 }
 
 // Client sends commands to one tvd.

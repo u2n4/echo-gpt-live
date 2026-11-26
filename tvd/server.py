@@ -246,7 +246,8 @@ def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, 
         if action == "screenshot":
             if huawei is None:
                 raise TVError("unconfigured", "Huawei TV host is not configured")
-            return await huawei.screenshot(args.get("max_width", 1024), args.get("quality", 6), budget)
+            return await huawei.screenshot(args.get("max_width", 1024), args.get("quality", 6), budget,
+                                           required_input=args.get("required_input", ""))
         return await ctl.state()
 
     async def handle(request: web.Request) -> web.Response:
@@ -295,7 +296,8 @@ def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, 
                 out = await asyncio.wait_for(run(action, args, budget), budget + 0.2)
                 if action == "screenshot":
                     return {"ok": True, "action": action, "image_b64": out.get("image_b64", ""),
-                            "input": out.get("input", ""), "state": await ctl.state()}
+                            "input": out.get("input", ""), "input_verified": out.get("input_verified", False),
+                            "state": await ctl.state()}
                 if action == "switch_input":
                     return {"ok": True, "action": action, "input": out.get("input", ""),
                             "state": await ctl.state()}

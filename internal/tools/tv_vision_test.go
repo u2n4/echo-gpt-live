@@ -14,11 +14,12 @@ import (
 )
 
 type mockTVVision struct {
-	mu      sync.Mutex
-	actions []string
-	args    []map[string]any
-	app     string
-	input   string
+	mu         sync.Mutex
+	actions    []string
+	args       []map[string]any
+	app        string
+	input      string
+	unverified bool
 }
 
 func (m *mockTVVision) Do(_ context.Context, action string, args map[string]any, _ time.Duration) (tv.Result, error) {
@@ -28,7 +29,7 @@ func (m *mockTVVision) Do(_ context.Context, action string, args map[string]any,
 	m.args = append(m.args, args)
 	switch action {
 	case "screenshot":
-		return tv.Result{OK: true, Input: m.input, ImageB64: "/9j/4AAQSkZJRg=="}, nil
+		return tv.Result{OK: true, Input: m.input, InputVerified: !m.unverified && m.input != "", ImageB64: "/9j/4AAQSkZJRg=="}, nil
 	case "state":
 		return tv.Result{OK: true, State: tv.State{Power: "on", Connected: true, App: m.app}}, nil
 	default:
@@ -189,8 +190,8 @@ func TestTVVisionRejectsPrematurePermissionQuestion(t *testing.T) {
 }
 
 func TestAppDescriptionRejectsUnconfirmedInput(t *testing.T) {
-	for _, input := range []string{"hdmi2", "unknown", ""} {
-		mock := &mockTVVision{input: input}
+	for _, input := range []string{"hdmi2", "unknown", "", "hdmi3"} {
+		mock := &mockTVVision{input: input, unverified: input == "hdmi3"}
 		// A rejected frame must return before the HTTP client is used.
 		_, err := describeTVScreen(context.Background(), mock, nil, "", "", "", "", "", "netflix")
 		if err == nil {

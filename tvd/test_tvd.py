@@ -811,6 +811,26 @@ class ExtendedRemoteTests(unittest.IsolatedAsyncioTestCase):
         s3 = huawei.build_monkey_script(2)
         self.assertEqual(s3.count("KEYCODE_DPAD_RIGHT"), 2)
 
+    async def test_screenshot_rejects_changed_or_unverified_hdmi(self):
+        from unittest.mock import AsyncMock, patch
+        from huawei import HuaweiTV
+
+        for observed, code, captured in (
+            (["hdmi2"], "input_mismatch", False),
+            (["unknown"], "unverified_input", False),
+            (["hdmi3", "hdmi2"], "input_mismatch", True),
+        ):
+            with self.subTest(observed=observed), patch("huawei.shutil.which", return_value=None):
+                device = HuaweiTV("test")
+                device._ensure_connected = AsyncMock()
+                device._read_input = AsyncMock(side_effect=observed)
+                device._exec = AsyncMock(return_value=(0, b"x" * 256, b""))
+                device._current_input = "hdmi3"  # An old successful switch is not evidence.
+                with self.assertRaises(TVError) as ctx:
+                    await device.screenshot(required_input="hdmi3")
+                self.assertEqual(ctx.exception.code, code)
+                self.assertEqual(device._exec.called, captured)
+
     async def test_server_switch_input_and_screenshot(self):
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
@@ -823,8 +843,8 @@ class ExtendedRemoteTests(unittest.IsolatedAsyncioTestCase):
             async def switch_input(self, target, timeout):
                 return {"input": "hdmi2", "index": 1}
 
-            async def screenshot(self, max_width, quality, timeout):
-                return {"image_b64": "AAAA", "input": "hdmi3"}
+            async def screenshot(self, max_width, quality, timeout, required_input):
+                return {"image_b64": "AAAA", "input": required_input, "input_verified": True}
 
         app = web.Application()
         app.router.add_post("/tv/cmd", server.make_handler(
@@ -834,7 +854,7 @@ class ExtendedRemoteTests(unittest.IsolatedAsyncioTestCase):
         try:
             for nonce, action, args in (
                 ("h" * 16, "switch_input", {"input": "cameras"}),
-                ("i" * 16, "screenshot", {}),
+                ("i" * 16, "screenshot", {"required_input": "hdmi3"}),
             ):
                 body = json.dumps({"v": 1, "nonce": nonce, "action": action, "args": args}).encode()
                 ts = str(int(time.time()))
@@ -847,6 +867,8 @@ class ExtendedRemoteTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(data["input"], "hdmi2")
                 else:
                     self.assertEqual(data["image_b64"], "AAAA")
+                    self.assertTrue(data["input_verified"])
+                    self.assertEqual(data["input"], "hdmi3")
         finally:
             await client.close()
 

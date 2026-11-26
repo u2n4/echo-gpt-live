@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -208,35 +209,35 @@ func TestKeenableParseAndModes(t *testing.T) {
 	}
 }
 
-// TestLadderFallsThrough proves the ladder does its job: a blocked engine is not the end of the
-// search. Wikipedia is real here because a fake one would test the fake.
+// Keep fallback selection deterministic. TestWebSearchLive exercises the real network.
 func TestLadderFallsThrough(t *testing.T) {
-	if testing.Short() {
-		t.Skip("network")
+	client := &http.Client{Transport: testTransport(func(req *http.Request) (*http.Response, error) {
+		status, body := http.StatusForbidden, ""
+		if strings.HasSuffix(req.URL.Host, ".wikipedia.org") {
+			status = http.StatusOK
+			body = `{"query":{"search":[{"title":"Riyadh","snippet":"Capital of Saudi Arabia"}]}}`
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	out, err := WebSearch(client, SearchViaReader).Run(context.Background(), map[string]any{"query": "الرياض"})
+	if err != nil || !strings.Contains(out, "wikipedia.org") {
+		t.Fatalf("Wikipedia fallback: %q, %v", out, err)
 	}
-	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`<html>anomaly</html>`))
-	}))
-	defer blocked.Close()
+}
 
-	oldK, oldD, oldR := keenableBase, ddgBase, readerBase
-	keenableBase = blocked.URL
-	ddgBase = blocked.URL
-	readerBase = blocked.URL + "/" // all web engines blocked, so only the encyclopedia is left
-	defer func() { keenableBase, ddgBase, readerBase = oldK, oldD, oldR }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	out, err := WebSearch(&http.Client{Timeout: 10 * time.Second}, SearchViaReader).
-		Run(ctx, map[string]any{"query": "الرياض"})
-	if err != nil {
-		t.Fatalf("both engines blocked and the encyclopedia did not answer: %v", err)
+func TestSearchFailureNamesEveryProviderWithoutTheQuery(t *testing.T) {
+	client := &http.Client{Transport: testTransport(func(req *http.Request) (*http.Response, error) {
+		status := http.StatusForbidden
+		if strings.HasSuffix(req.URL.Host, ".wikipedia.org") {
+			status = http.StatusServiceUnavailable
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+	_, err := WebSearch(client, SearchViaReader).Run(context.Background(), map[string]any{"query": "private query"})
+	want := "the search did not go through: keenable=http_403 direct=http_403 reader=http_403 wikipedia=http_503"
+	if err == nil || err.Error() != want {
+		t.Fatalf("provider outcomes: %v", err)
 	}
-	if !strings.Contains(out, "wikipedia.org") {
-		t.Fatalf("expected the last rung to answer:\n%s", out)
-	}
-	t.Logf("%s", out)
 }
 
 // TestWebSearchLive hits the real ladder. It is the only thing that catches an engine changing its

@@ -34,6 +34,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -250,14 +251,17 @@ func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, keen
 		pending[r.rank] = true
 	}
 	best := answer{rank: 99}
-	var lastErr error
+	var outcomes [4]string
+	failed := false
 	for len(pending) > 0 {
 		a := <-out
 		delete(pending, a.rank)
 		switch {
 		case a.err != nil:
-			lastErr = fmt.Errorf("%s: %w", a.name, a.err)
+			outcomes[a.rank] = a.name + "=" + searchFailure(a.err)
+			failed = true
 		case len(a.hits) == 0:
+			outcomes[a.rank] = a.name + "=no_results"
 		case a.rank < best.rank:
 			best = a
 		}
@@ -281,12 +285,45 @@ func searchNow(ctx context.Context, client *http.Client, depth SearchDepth, keen
 		}
 		return best.hits, nil
 	}
-	if lastErr != nil {
+	if failed {
 		// "Nothing was found" and "the search itself did not work" are different sentences to say
 		// out loud, so they are different returns here.
-		return nil, fmt.Errorf("the search did not go through: %w", lastErr)
+		var details []string
+		for _, outcome := range outcomes {
+			if outcome != "" {
+				details = append(details, outcome)
+			}
+		}
+		return nil, &SearchUnavailable{details: strings.Join(details, " ")}
 	}
 	return nil, nil
+}
+
+// SearchUnavailable reports provider outcomes without including search terms or URLs.
+type SearchUnavailable struct{ details string }
+
+func (e *SearchUnavailable) Error() string { return "the search did not go through: " + e.details }
+
+var errSearchChallenge = errors.New("the engine is refusing this address as automated traffic")
+
+type searchHTTPStatus int
+
+func (s searchHTTPStatus) Error() string { return fmt.Sprintf("answered %d", s) }
+
+func searchFailure(err error) string {
+	var status searchHTTPStatus
+	switch {
+	case errors.Is(err, errSearchChallenge):
+		return "challenge"
+	case errors.As(err, &status):
+		return fmt.Sprintf("http_%d", status)
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "request_error"
+	}
 }
 
 func render(hits []webResult) string {
@@ -373,7 +410,7 @@ func keenableSearch(ctx context.Context, client *http.Client, apiKey, q string) 
 		return nil, err
 	}
 	if res.StatusCode >= 400 {
-		return nil, fmt.Errorf("answered %d", res.StatusCode)
+		return nil, searchHTTPStatus(res.StatusCode)
 	}
 	var parsed struct {
 		Results []struct {
@@ -493,7 +530,7 @@ func ddgLiteFrom(ctx context.Context, client *http.Client, u string, hdr map[str
 	if len(out) == 0 && strings.Contains(page, "anomaly") {
 		// The challenge page arrives as HTTP 202, so status alone cannot tell this from an honest
 		// empty result. Naming it is what stops the next person re-measuring it.
-		return nil, fmt.Errorf("the engine is refusing this address as automated traffic")
+		return nil, errSearchChallenge
 	}
 	return out, nil
 }
@@ -619,7 +656,7 @@ func get(ctx context.Context, client *http.Client, u string, limit int64, hdr ma
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, limit))
 	if res.StatusCode >= 400 {
-		return nil, fmt.Errorf("answered %d", res.StatusCode)
+		return nil, searchHTTPStatus(res.StatusCode)
 	}
 	if err != nil {
 		return nil, err
