@@ -6,27 +6,28 @@
 #
 # The first session also kicks the control socket mid-call to run the reattach path.
 # Never touches the live bridge on 8787 (safe-port refuses to start beside it).
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 N="${1:-5}"; SECS="${2:-20}"
+[[ "$N" =~ ^[1-9][0-9]*$ && "$SECS" =~ ^[1-9][0-9]*$ ]] || { echo "sessions and seconds must be positive integers" >&2; exit 2; }
 source "$ROOT/scripts/lib/safe-port.sh"
 P="$(pick_free_port 8811)"; assert_not_live "$P"
 OUT=/tmp/prove; mkdir -p "$OUT"
+BP=""
+trap 'stop_child "$BP"' EXIT
 echo "test bridge on 127.0.0.1:$P; the live bridge on 8787 is not touched"
 for i in $(seq 1 "$N"); do
   name="prove-$i-$(date -u +%H%M%S)"
   kick=""; [ "$i" -eq 1 ] && kick="--test-kick-sideband-after 8s"
-  greet=""; [ -f media/hala.ogg ] && greet="--greeting media/hala.ogg"
   ./bin/bridge --run "$name" --runs-dir "$OUT" --listen "127.0.0.1:$P" --udp-port 50001 \
     --video sendonly --video-fps 1 --idle-close 60s --hold-after-disconnect 2s --delegation client \
-    --daily-budget-usd 2.0 --tools --web-search=free --farewell-grace 2s --memory-file "$OUT/memory.md" \
-    $kick $greet > "$OUT/$name.stderr" 2>&1 &
+    --daily-budget-usd 2.0 --tools --web-search=free --farewell-grace 2s --memory-file "$OUT/$name.memory.md" \
+    $kick > "$OUT/$name.stderr" 2>&1 &
   BP=$!
-  sleep 2
-  if ! ss -lnt "sport = :$P" | grep -q ":$P"; then echo "bridge never listened"; kill -INT $BP; wait $BP; exit 3; fi
+  wait_owned_tcp "$BP" "$P" || exit 3
   timeout $((SECS + 40)) ./bin/echosim --url "http://127.0.0.1:$P" --duration "${SECS}s" --audio-file media/hello.ogg \
     > "$OUT/$name.sim.json" 2> "$OUT/$name.sim.err"
-  kill -INT $BP 2>/dev/null; wait $BP 2>/dev/null
+  stop_child "$BP"; BP=""
   f="$OUT/$name/events.jsonl"
   python3 - "$f" "$OUT/$name.sim.json" "$i" <<'PY'
 import json,sys

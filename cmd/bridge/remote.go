@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/u2n4/echo-gpt-live/internal/tv"
 )
@@ -517,9 +518,10 @@ type remote struct {
 	echo bool // some fragment of the words waiting to be read arrived while she was speaking
 	// overflow: the words waiting to be read outgrew remoteTail and lost their beginning, which
 	// may have been what made them conversation (Codex). Such an utterance never acts.
-	overflow    bool
-	prefixFired bool      // a leading app/HDMI command already started while the speaker keeps talking
-	firstAt     time.Time // when the first fragment of the words waiting to be read arrived
+	overflow     bool
+	prefixFired  bool      // a leading app/HDMI command already started while the speaker keeps talking
+	prefixCmdStr string    // String() of the leading command that already fired, for deduping in flush()
+	firstAt      time.Time // when the first fragment of the words waiting to be read arrived
 	// chainConv/chainAt: utterances that follow each other within remoteLookback form a chain;
 	// chainConv says whether ANY of them was conversation (a word that is no command, count or
 	// filler, or an overflow). A power or remote-mode phrase in a conversational chain does not act,
@@ -563,7 +565,7 @@ func newRemote(c tvDoer, ev func(string, ...any)) *remote {
 // clearLocked forgets the call in progress; the caller holds r.mu.
 func (r *remote) clearLocked() {
 	r.gen++
-	r.raw, r.echo, r.overflow, r.prefixFired, r.active, r.speaking, r.say = "", false, false, false, false, nil, nil
+	r.raw, r.echo, r.overflow, r.prefixFired, r.prefixCmdStr, r.active, r.speaking, r.say = "", false, false, false, "", false, nil, nil
 	r.lastCmd, r.firstAt, r.chainAt = time.Time{}, time.Time{}, time.Time{}
 	r.chainConv, r.chainNeg, r.handled, r.handledAt = false, false, "", time.Time{}
 	if r.timer != nil {
@@ -716,34 +718,40 @@ func (r *remote) Feed(tok uint64, text string) {
 	// phrase continuation), fire the leading nav words right now with 0 ms wait!
 	if hadPrev && r.active && !r.echo && !r.overflow && !r.chainNeg {
 		if now.Sub(r.lastCmd) <= remoteIdle {
-			words := strings.Fields(normaliseRemote(r.raw))
-			if len(words) >= 2 {
-				allInstant := true
-				for _, w := range words {
-					if !instantNavWords[w] {
-						allInstant = false
-						break
-					}
-				}
-				if allInstant {
-					// Fire all words except the trailing one (which might still get a count like "5 مرات").
-					for _, w := range words[:len(words)-1] {
-						if c, ok := remoteWords[w]; ok {
-							streamCmds = append(streamCmds, c)
+			normRaw := normaliseRemote(r.raw)
+			// Only stream-fire when no phrase-table entry or press-verb collapse applies (so "اطلع فوق"
+			// or "اضغطي فوق" never fires two buttons!).
+			if strings.TrimSpace(applyPhrases(" "+normRaw+" ")) == normRaw {
+				words := strings.Fields(normRaw)
+				if len(words) >= 2 && len(collapsePressVerb(words)) == len(words) {
+					allInstant := true
+					for _, w := range words {
+						if !instantNavWords[w] {
+							allInstant = false
+							break
 						}
 					}
-					if len(streamCmds) > 0 {
-						streamCtx = r.ctx
-						streamNow = now
-						tail := words[len(words)-1]
-						if len(text) > 0 && unicode.IsSpace(rune(text[len(text)-1])) {
-							tail += " "
+					if allInstant {
+						// Fire all words except the trailing one (which might still get a count like "5 مرات").
+						for _, w := range words[:len(words)-1] {
+							if c, ok := remoteWords[w]; ok {
+								streamCmds = append(streamCmds, c)
+							}
 						}
-						r.raw = tail
-						r.lastCmd = now
-						r.chainConv, r.chainNeg, r.chainAt = false, false, now
-						r.handled, r.handledAt = normaliseRemote(strings.Join(words, " ")), now
-						streamEv = "remote_stream_fired"
+						streamCmds = capPresses(streamCmds)
+						if len(streamCmds) > 0 {
+							streamCtx = r.ctx
+							streamNow = now
+							tail := words[len(words)-1]
+							if lr, _ := utf8.DecodeLastRuneInString(text); unicode.IsSpace(lr) {
+								tail += " "
+							}
+							r.raw = tail
+							r.lastCmd = now
+							r.chainConv, r.chainNeg, r.chainAt = false, false, now
+							r.handled, r.handledAt = normaliseRemote(strings.Join(words, " ")), now
+							streamEv = "remote_stream_fired"
+						}
 					}
 				}
 			}
@@ -756,6 +764,7 @@ func (r *remote) Feed(tok uint64, text string) {
 		if !inChain || !r.chainConv {
 			if cmd, ok := leadingPrefixCmd(r.raw); ok {
 				r.prefixFired = true
+				r.prefixCmdStr = cmd.String()
 				r.active = true
 				r.lastCmd = now
 				streamCmds = []remoteCmd{cmd}
@@ -804,8 +813,8 @@ func (r *remote) flush(tok, seq uint64) {
 		r.mu.Unlock()
 		return
 	}
-	utter, echo, overflow, prefixFired, firstAt, ctx := r.raw, r.echo, r.overflow, r.prefixFired, r.firstAt, r.ctx
-	r.raw, r.echo, r.overflow, r.prefixFired, r.timer = "", false, false, false, nil
+	utter, echo, overflow, prefixFired, prefixCmdStr, firstAt, ctx := r.raw, r.echo, r.overflow, r.prefixFired, r.prefixCmdStr, r.firstAt, r.ctx
+	r.raw, r.echo, r.overflow, r.prefixFired, r.prefixCmdStr, r.timer = "", false, false, false, "", nil
 	now := time.Now()
 	if r.active && now.Sub(r.lastCmd) > remoteIdle {
 		r.active = false
@@ -829,9 +838,10 @@ func (r *remote) flush(tok, seq uint64) {
 		return
 	}
 	p := parseRemote(utter, r.active)
-	if prefixFired && p.pureCommand && len(p.cmds) == 1 {
-		// That single opening command already fired via remote_prefix_fired; do not run it twice.
-		p.cmds = nil
+	if prefixFired && p.pureCommand && len(p.cmds) > 0 && (prefixCmdStr == "" || p.cmds[0].String() == prefixCmdStr) {
+		// That opening command already fired via remote_prefix_fired; drop it so compound commands
+		// like "افتح يوتيوب يمين" never launch the app twice.
+		p.cmds = p.cmds[1:]
 	}
 	conv := isConversation(utter)
 	neg := hasRemoteBlockerWord(utter)
@@ -923,8 +933,12 @@ func (r *remote) runJob(job remoteJob) {
 		ctx, cancel := context.WithTimeout(job.ctx, budgetFor(c.action)+time.Second)
 		res, err := r.tv.Do(ctx, c.action, c.args, budgetFor(c.action))
 		if err == nil && !res.OK && c.action == "set_mute" && res.Error == "unknown" {
-			// Box did not report mute state: fall back to direct VOLUME_MUTE toggle.
-			res, err = r.tv.Do(ctx, "toggle_mute", nil, budgetFor("toggle_mute"))
+			if m, _ := c.args["mute"].(bool); m {
+				// Box did not report mute state: only fall back to toggle when muting (never unmute).
+				fctx, fcancel := context.WithTimeout(job.ctx, budgetFor("toggle_mute")+time.Second)
+				res, err = r.tv.Do(fctx, "toggle_mute", nil, budgetFor("toggle_mute"))
+				fcancel()
+			}
 		}
 		cancel()
 		errCode := res.Error
@@ -947,7 +961,7 @@ func (r *remote) runJob(job remoteJob) {
 func (r *remote) complain(code string) {
 	line := "ما قدرت أوصل للتلفزيون."
 	if code == "off" {
-		line = "التلفزيون طافي، قل شغّل التلفزيون."
+		line = "التلفزيون طافي الحين."
 	}
 	r.mu.Lock()
 	say := r.say

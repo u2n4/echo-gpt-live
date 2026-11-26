@@ -18,10 +18,16 @@ def pages(data):
                 return
             off = nxt
             continue
+        if len(data) - off < 27:
+            raise ValueError("truncated Ogg page header")
         ver, htype, granule, serial, seq, crc, nseg = struct.unpack_from("<BBqIIIB", data, off + 4)
         segtab = data[off + 27:off + 27 + nseg]
+        if len(segtab) != nseg:
+            raise ValueError("truncated Ogg segment table")
         body = off + 27 + nseg
         size = sum(segtab)
+        if body + size > len(data):
+            raise ValueError("truncated Ogg page body")
         yield htype, granule, serial, seq, segtab, data[body:body + size]
         off = body + size
 

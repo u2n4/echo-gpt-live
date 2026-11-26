@@ -185,6 +185,9 @@ func (b *Budget) withLock(fn func(f *budgetFile) bool) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("budget rename: %w", nerr)
 	}
+	if err := syncDirectory(filepath.Dir(b.path)); err != nil {
+		return fmt.Errorf("budget directory sync: %w", err)
+	}
 	return nil
 }
 

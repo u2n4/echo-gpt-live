@@ -3,6 +3,8 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +13,194 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+// A short HTTP body can deliver all its JSON before reporting a framing error.
+type failedResponseBody struct {
+	io.Reader
+	cancel context.CancelFunc
+}
+
+func (b failedResponseBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err == io.EOF {
+		b.cancel()
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+func TestLiveBodyReadFailureClosesRecoveredSession(t *testing.T) {
+	for _, fork := range []bool{false, true} {
+		for _, raw := range []string{
+			`{"session":{"id":"live_recovered"},"transport":{"sdp":"v=0\r\n"}}`,
+			`{"session":{"id":"live_recovered"},"transport":`,
+			`{"session":{"id":"live_recovered"`,
+			`{"session":{"id":"live_recovered","model":`,
+		} {
+			for _, cleanupStatus := range []int{200, 401, 503} {
+				t.Run(fmt.Sprintf("fork=%v/body=%s/cleanup=%d", fork, raw, cleanupStatus), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					c := NewLive("fake-key", LiveModel)
+					var err error
+					c.Ledger, err = NewLedger(filepath.Join(t.TempDir(), "open"), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					c.Budget, err = NewBudget(filepath.Join(t.TempDir(), "spend.json"), 1, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					creates, hangups := 0, 0
+					c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if strings.HasSuffix(r.URL.Path, "/live_recovered/hangup") {
+							hangups++
+							deadline, ok := r.Context().Deadline()
+							if ctx.Err() == nil || r.Context().Err() != nil || !ok || time.Until(deadline) > 20*time.Second {
+								t.Fatal("cleanup must have an independent, bounded context")
+							}
+							if ids := c.Ledger.Open(); len(ids) != 1 || ids[0] != "live_recovered" {
+								t.Fatalf("session not persisted before cleanup: %v", ids)
+							}
+							return &http.Response{StatusCode: cleanupStatus, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+						}
+						creates++
+						return &http.Response{StatusCode: 201, Body: io.NopCloser(failedResponseBody{strings.NewReader(raw), cancel})}, nil
+					})}
+					if fork {
+						_, err = c.Fork(ctx, "live_source", "offer")
+					} else {
+						_, err = c.CreateSession(ctx, "offer", LiveSessionConfig{})
+					}
+					wantHangups := 1
+					if cleanupStatus == 503 {
+						wantHangups = 3
+					}
+					if !errors.Is(err, io.ErrUnexpectedEOF) || !errors.Is(err, ErrSessionCreated) || creates != 1 || hangups != wantHangups {
+						t.Fatalf("err=%v creates=%d hangups=%d", err, creates, hangups)
+					}
+					wantOpen := 0
+					if cleanupStatus >= 300 {
+						wantOpen = 1
+					}
+					if ids := c.Ledger.Open(); len(ids) != wantOpen {
+						t.Fatalf("ledger=%v want %d entries", ids, wantOpen)
+					}
+					spent, sessions := c.Budget.Report()
+					if sessions != 1 || spent != EstimateLiveCostUSD(0) {
+						t.Fatalf("spent=%v sessions=%d", spent, sessions)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRecoveredLiveIDRequiresCompleteStringAtSessionID(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`{"session":`, ""},
+		{`{"session":{"id":`, ""},
+		{`{"session":{"id":"live_recover`, ""},
+		{`{"session":{"id":"live_recovered\`, ""},
+		{`{"session":{"id":"live_recovered\u00`, ""},
+		{`{"session":{"id":123`, ""},
+		{`{"session":{"id":null`, ""},
+		{`{"id":"wrong","session":{"nested":{"id":"wrong"},"id":"live_recovered"`, "live_recovered"},
+		{`{"session":{"nested":{"id":"wrong"},"model":`, ""},
+		{`{"session":{"id":"live_recovered"`, "live_recovered"},
+		{`{"session":{"id":"live_\u0072ecovered","model":`, "live_recovered"},
+	} {
+		if got := recoveredLiveID([]byte(tc.raw)); got != tc.want {
+			t.Errorf("recoveredLiveID(%q)=%q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestLiveTruncationBoundaries(t *testing.T) {
+	const body = `{"session":{"id":"live_recovered","model":`
+	idEnd := strings.Index(body, `","model"`) + 1
+	for _, fork := range []bool{false, true} {
+		for _, readFailure := range []bool{false, true} {
+			for cut := 0; cut <= len(body); cut++ {
+				t.Run(fmt.Sprintf("fork=%v/readFailure=%v/cut=%d", fork, readFailure, cut), func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					c := NewLive("fake-key", LiveModel)
+					var err error
+					c.Ledger, err = NewLedger(filepath.Join(t.TempDir(), "open"), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					c.Budget, err = NewBudget(filepath.Join(t.TempDir(), "spend.json"), 1, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					creates, hangups := 0, 0
+					c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if strings.HasSuffix(r.URL.Path, "/hangup") {
+							hangups++
+							if r.URL.Path != "/v1/live/sessions/live_recovered/hangup" || cut < idEnd {
+								t.Fatalf("cleanup used incomplete/wrong id: %s", r.URL.Path)
+							}
+							if ids := c.Ledger.Open(); len(ids) != 1 || ids[0] != "live_recovered" {
+								t.Fatalf("missing ledger before cleanup: %v", ids)
+							}
+							return &http.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+						}
+						creates++
+						var reader io.Reader = strings.NewReader(body[:cut])
+						if readFailure {
+							reader = failedResponseBody{reader, cancel}
+						}
+						return &http.Response{StatusCode: 201, Body: io.NopCloser(reader)}, nil
+					})}
+					var sess *LiveSession
+					if fork {
+						sess, err = c.Fork(ctx, "live_source", "offer")
+					} else {
+						sess, err = c.CreateSession(ctx, "offer", LiveSessionConfig{})
+					}
+					want := 0
+					if cut >= idEnd {
+						want = 1
+					}
+					spent, sessions := c.Budget.Report()
+					if sess != nil || err == nil || errors.Is(err, ErrSessionCreated) != (want == 1) || creates != 1 || hangups != want || len(c.Ledger.Open()) != want || sessions != want || spent != float64(want)*EstimateLiveCostUSD(0) {
+						t.Fatalf("sess=%v err=%v creates=%d hangups=%d ledger=%v sessions=%d spent=%v want=%d", sess, err, creates, hangups, c.Ledger.Open(), sessions, spent, want)
+					}
+					if readFailure && !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("lost body read error: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRealtimeBodyReadFailureClosesLocation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := New("fake-key", "fake-model")
+	hangups := 0
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/rtc_recovered/hangup") {
+			hangups++
+			deadline, ok := r.Context().Deadline()
+			if ctx.Err() == nil || r.Context().Err() != nil || !ok || time.Until(deadline) > 20*time.Second {
+				t.Fatal("cleanup must have an independent, bounded context")
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		}
+		return &http.Response{StatusCode: 201, Header: http.Header{"Location": {"/v1/realtime/calls/rtc_recovered"}},
+			Body: io.NopCloser(failedResponseBody{strings.NewReader("v=0\r\n"), cancel})}, nil
+	})}
+	_, err := c.CreateCall(ctx, "offer")
+	if !errors.Is(err, io.ErrUnexpectedEOF) || hangups != 1 {
+		t.Fatalf("err=%v hangups=%d", err, hangups)
+	}
+}
 
 // liveCreateServer answers the first request with the given error body and every later one with a
 // valid session, recording the session object of every request so the retry can be inspected.
@@ -224,7 +413,6 @@ func TestCreateSessionDropsStandbyWhenRejected(t *testing.T) {
 	if _, ok := (*seen)[1]["idle_timeout_s"]; ok {
 		t.Fatal("retry must omit idle_timeout_s")
 	}
-	// Second session skips standby immediately without paying a failed round trip.
 	if _, err := c.CreateSession(context.Background(), "v=0\r\n", cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -237,18 +425,24 @@ func TestCreateSessionDropsStandbyWhenRejected(t *testing.T) {
 }
 
 func TestEstimateLiveCostWithStandbyUSD(t *testing.T) {
-	// 60 s total: 15 s active ($0.0125) + 45 s standby ($0.015) = $0.0275
 	got := EstimateLiveCostWithStandbyUSD(60*1e9, 45*1e9)
 	want := 0.0275
 	if diff := got - want; diff < -1e-9 || diff > 1e-9 {
 		t.Fatalf("cost = %.6f, want %.6f", got, want)
 	}
-	// Short session respects the 15 s init floor ($0.0125)
 	if floor := EstimateLiveCostWithStandbyUSD(5*1e9, 5*1e9); floor < 0.0124 || floor > 0.0126 {
 		t.Fatalf("floor = %.6f, want 0.0125", floor)
 	}
-	// Effective duration for 15 s active + 45 s standby = 15 s + 18 s = 33 s
 	if eff := EffectiveBilledDuration(60*1e9, 45*1e9); eff != 33*1e9 {
 		t.Fatalf("effective = %v, want 33s", eff)
+	}
+}
+
+func TestCleanSpokenAnswerStripsCitations(t *testing.T) {
+	in := `سعره أربعة آلاف ريال. ([sa.pricena.com](https://sa.pricena.com/ar/product/iphone?utm_source=openai))`
+	got := cleanSpokenAnswer(in)
+	want := `سعره أربعة آلاف ريال.`
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

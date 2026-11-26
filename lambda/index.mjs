@@ -70,7 +70,7 @@ const TV_HOME_SHORTCUT = "amzn1.alexa-ask-target.shortcut.33122";
 // Alexa.KeypadController keystroke -> tvd key name (tvd/controller.py NAV_KEYS)
 const TV_KEYS = { UP: "up", DOWN: "down", LEFT: "left", RIGHT: "right", SELECT: "select", BACK: "back" };
 const TV_MAX_STEPS = 5;
-const TV_DEFAULT_STEPS = 1; // Ali, 2026-10-18: a bare "volume up" is one step
+const TV_DEFAULT_STEPS = 1; // bare "volume up" is one step
 
 const uuid = () => crypto.randomUUID();
 

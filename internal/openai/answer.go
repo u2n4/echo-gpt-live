@@ -119,10 +119,11 @@ type Answerer struct {
 	// another goroutine while a delegation may be reading it, so it lives behind an atomic.
 	context atomic.Pointer[string]
 
-	// noReasoningField / noTierField remember rejected optional tuning fields so retries happen
-	// once per process rather than once per question.
+	// noReasoningField / noTierField / noCacheKeyField remember rejected optional tuning fields so
+	// retries happen once per process rather than once per question.
 	noReasoningField atomic.Bool
 	noTierField      atomic.Bool
+	noCacheKeyField  atomic.Bool
 }
 
 // SetContext replaces what the router is told about where, when and who; safe from any goroutine.
@@ -369,9 +370,12 @@ func (a *Answerer) Answer(ctx context.Context, q Question) (string, error) {
 
 	for round := 0; round < answerRounds; round++ {
 		body := map[string]any{
-			"model":            a.model(),
-			"input":            input,
-			"prompt_cache_key": "astra-router-v1",
+			"model": a.model(),
+			"input": input,
+			"store": false,
+		}
+		if !a.noCacheKeyField.Load() {
+			body["prompt_cache_key"] = "astra-router-v1"
 		}
 		// The LAST round offers no tools at all. It used to offer them, run whatever came back, and
 		// then return "gave up" regardless — so an append could land on disk and be reported as a
@@ -400,7 +404,8 @@ func (a *Answerer) Answer(ctx context.Context, q Question) (string, error) {
 
 		out, err := a.postRound(ctx, body)
 		var ae *apiError
-		if err != nil && errors.As(err, &ae) && strings.Contains(ae.Message, "prompt_cache_key") {
+		if err != nil && errors.As(err, &ae) && strings.Contains(ae.Message, "prompt_cache_key") && !a.noCacheKeyField.Load() {
+			a.noCacheKeyField.Store(true)
 			delete(body, "prompt_cache_key")
 			out, err = a.postRound(ctx, body)
 		}
@@ -480,7 +485,8 @@ func (a *Answerer) Answer(ctx context.Context, q Question) (string, error) {
 		together := true
 		for _, call := range calls {
 			usedTools = append(usedTools, call.Name)
-			together = together && call.Name == calls[0].Name
+			// Never run physical TV commands or Vision loops concurrently (must stay ordered).
+			together = together && call.Name == calls[0].Name && call.Name != "tv_control" && call.Name != "tv_vision"
 		}
 		if together {
 			var wg sync.WaitGroup
@@ -537,38 +543,25 @@ func (a *Answerer) Answer(ctx context.Context, q Question) (string, error) {
 	return "", fmt.Errorf("gave up after %d rounds of tools", answerRounds)
 }
 
-// roundWait is how long one model round may take before it is abandoned and asked again. The
-// rounds measured on 16 September 2026 were 1.1-2.7 s; one request of thirty then sat for the
-// whole 25 s deadline and answered nothing. A stalled request is not a slow one, and the second
-// attempt is what a person would do.
+// Bound the wait for one model response, including server-side search.
 const (
 	roundWait       = 12 * time.Second
 	searchRoundWait = 20 * time.Second
 )
 
-// postRound posts one round with its own patience, and tries once more on a stall while the
-// deadline allows it.
+// A timed-out generation can still be billed. Leave retry decisions to the caller.
 func (a *Answerer) postRound(ctx context.Context, body map[string]any) (*respBody, error) {
 	wait := roundWait
 	if a.WebSearch {
-		// Server-side OpenAI web_search fetches pages inside one Responses call.
 		wait = searchRoundWait
 	}
-	for attempt := 1; ; attempt++ {
-		rctx, cancel := context.WithTimeout(ctx, wait)
-		out, err := a.post(rctx, body)
-		cancel()
-		if err == nil || ctx.Err() != nil || attempt == 2 {
-			return out, err
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			return out, err
-		}
-		a.event("answer_round_stalled", "after_s", wait.Seconds(), "note", "asking again")
-	}
+	rctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	return a.post(rctx, body)
 }
 
 func (a *Answerer) post(ctx context.Context, body map[string]any) (*respBody, error) {
+	body["store"] = false
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err

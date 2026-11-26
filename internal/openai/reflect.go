@@ -66,6 +66,7 @@ func (a *Answerer) ReflectFull(ctx context.Context, facts []string, transcript s
 	}
 	body := map[string]any{
 		"model": rmodel,
+		"store": false,
 		"input": []any{
 			map[string]any{"role": "system", "content": reflectSystem},
 			map[string]any{"role": "user", "content": "Current active household memory:\n" + known +
@@ -81,15 +82,14 @@ func (a *Answerer) ReflectFull(ctx context.Context, facts []string, transcript s
 			reffort = "low"
 		}
 	}
-	if reffort != "off" && !strings.HasPrefix(rmodel, "gpt-4.1") && !strings.HasPrefix(rmodel, "gpt-4o") && !strings.Contains(rmodel, "nano") && !a.noReasoningField.Load() {
+	if reffort != "off" && !strings.HasPrefix(rmodel, "gpt-4.1") && !strings.HasPrefix(rmodel, "gpt-4o") && !strings.Contains(rmodel, "nano") {
 		body["reasoning"] = map[string]any{"effort": reffort}
 	} else if strings.HasPrefix(rmodel, "gpt-5.4-nano") {
 		body["reasoning"] = map[string]any{"effort": "none"}
 	}
 	out, err := a.post(ctx, body)
 	var ae *apiError
-	if err != nil && errors.As(err, &ae) && strings.Contains(ae.Message, "reasoning") && !a.noReasoningField.Load() {
-		a.noReasoningField.Store(true)
+	if err != nil && errors.As(err, &ae) && strings.Contains(ae.Message, "reasoning") && body["reasoning"] != nil {
 		delete(body, "reasoning")
 		out, err = a.post(ctx, body)
 	}

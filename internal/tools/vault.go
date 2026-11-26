@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -44,12 +45,19 @@ func noRedirect(*http.Request, []*http.Request) error {
 
 func (v *VaultClient) client() *http.Client {
 	if v.HTTP != nil {
-		return v.HTTP
+		client := *v.HTTP
+		client.CheckRedirect = noRedirect
+		return &client
 	}
 	return &http.Client{Timeout: 6 * time.Second, CheckRedirect: noRedirect}
 }
 
 func (v *VaultClient) do(ctx context.Context, method, path string, body io.Reader) ([]byte, error) {
+	u, err := url.Parse(v.Base)
+	if err != nil || u.Hostname() == "" || u.User != nil ||
+		(u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback()))) {
+		return nil, fmt.Errorf("notes endpoint requires HTTPS or loopback HTTP without embedded credentials")
+	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(v.Base, "/")+path, body)
 	if err != nil {
 		return nil, err
@@ -65,7 +73,10 @@ func (v *VaultClient) do(ctx context.Context, method, path string, body io.Reade
 		return nil, fmt.Errorf("the notes machine did not answer: %w", err)
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 256<<10))
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 256<<10))
+	if err != nil {
+		return nil, fmt.Errorf("reading notes response: %w", err)
+	}
 	if res.StatusCode >= 300 {
 		// 3xx included: with redirects refused, a redirect IS the answer, and it is not one.
 		return nil, fmt.Errorf("the notes machine answered %d", res.StatusCode)

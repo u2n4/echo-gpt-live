@@ -19,6 +19,16 @@ func unlockFile(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
+// Persist the rename itself, not only the replacement file's contents.
+func syncDirectory(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // pidAlive reports whether a process with this id exists. EPERM means it exists and belongs to
 // someone else, which is still alive.
 func pidAlive(pid int) bool {

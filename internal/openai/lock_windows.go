@@ -22,6 +22,10 @@ func unlockFile(f *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, ol)
 }
 
+// Windows has no portable directory-fsync operation; the replacement file is synced
+// before Rename. The Linux service additionally persists directory metadata.
+func syncDirectory(string) error { return nil }
+
 // pidAlive reports whether a process with this id exists. Opening it with the least right there
 // is succeeds for any live process, including another user's; a dead id fails.
 func pidAlive(pid int) bool {

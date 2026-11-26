@@ -331,9 +331,12 @@ func (p *Profile) ForgetMatching(query string) ([]string, error) {
 		return nil, fmt.Errorf("specify what to forget")
 	}
 	matches := func(s string) bool {
-		norm := normArabic(s)
+		wordSet := map[string]bool{}
+		for _, w := range strings.Fields(normArabic(s)) {
+			wordSet[w] = true
+		}
 		for _, tok := range tokens {
-			if !strings.Contains(norm, tok) {
+			if !wordSet[tok] {
 				return false
 			}
 		}

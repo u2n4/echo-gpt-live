@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/pion/rtp"
@@ -90,6 +90,7 @@ func playH264(ctx context.Context, path string, fps float64, track *webrtc.Track
 		au := aus[i%len(aus)]
 		if err := track.WriteSample(media.Sample{Data: au, Duration: frameDur}); err != nil {
 			onErr(err)
+			return
 		}
 		n++
 		if onFrame != nil {
@@ -143,10 +144,12 @@ func loadAccessUnits(path string) ([][]byte, error) {
 
 // reflector forwards received audio RTP back to the local track after an optional delay.
 type reflector struct {
+	mu      sync.Mutex
+	closed  bool
+	stopped chan struct{}
 	track   *webrtc.TrackLocalStaticRTP
 	delay   time.Duration
 	ch      chan delayed
-	dropped atomic.Int64
 }
 
 type delayed struct {
@@ -155,37 +158,43 @@ type delayed struct {
 }
 
 func newReflector(track *webrtc.TrackLocalStaticRTP, delay time.Duration) *reflector {
-	r := &reflector{track: track, delay: delay, ch: make(chan delayed, 1024)}
+	r := &reflector{track: track, delay: delay, ch: make(chan delayed, 1024), stopped: make(chan struct{})}
 	go r.run()
 	return r
 }
 
 func (r *reflector) push(p *rtp.Packet) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
 	select {
 	case r.ch <- delayed{at: time.Now().Add(r.delay), pkt: p}:
 	default: // drop if the delay buffer is full; never block the receive loop
-		r.dropped.Add(1)
 	}
 }
 
 func (r *reflector) run() {
+	defer close(r.stopped)
 	for d := range r.ch {
 		if w := time.Until(d.at); w > 0 {
 			time.Sleep(w)
 		}
 		// Pion rewrites SSRC and payload type to the local track's binding; the
 		// Opus payload, sequence number, timestamp and marker are forwarded unchanged.
-		// A write failure means the track is gone; count it, do not block the loop.
-		if err := r.track.WriteRTP(d.pkt); err != nil {
-			r.dropped.Add(1)
-		}
+		_ = r.track.WriteRTP(d.pkt)
 	}
 }
 
-// Dropped reports reflector packets lost to a full buffer or a dead track.
-func (r *reflector) Dropped() int64 { return r.dropped.Load() }
-
-func (r *reflector) close() { close(r.ch) }
+func (r *reflector) close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed {
+		r.closed = true
+		close(r.ch)
+	}
+}
 
 // PlayOggOnce streams an Ogg/Opus file once, in real time, into a sample track.
 // Exported for the OpenAI leg test, which speaks one utterance then listens.

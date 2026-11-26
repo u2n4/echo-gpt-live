@@ -5,7 +5,7 @@
 # Refuses to restart while a call is open (the ledger of billed sessions is not empty): a
 # restart in the middle of a call hangs up on him.
 set -euo pipefail
-HOST="${HOST:-ubuntu-alexa}"
+HOST="${HOST:?set HOST to your ssh host (e.g. HOST=bridge-host)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_BACKUPS='~/.local/state/rtcdiag/backups'
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST")

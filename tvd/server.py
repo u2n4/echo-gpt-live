@@ -167,6 +167,22 @@ def budget_for(req: dict, wall=time.time) -> float | None:
     return min(cap, left)
 
 
+LOCAL_ONLY_ACTIONS = {"screenshot", "switch_input", "text"}
+
+
+def _safe_log_args(args: dict) -> dict:
+    """Redact user-typed text and URLs before writing command logs."""
+    out = {}
+    for k, v in args.items():
+        if k == "text" and isinstance(v, str):
+            out["text_len"] = len(v)
+        elif k == "url" and isinstance(v, str):
+            out["url_len"] = len(v)
+        else:
+            out[k] = v
+    return out
+
+
 def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, wall=time.time,
                  max_in_flight: int = MAX_IN_FLIGHT, huawei: HuaweiTV | None = None):
     from aiohttp import web
@@ -264,6 +280,13 @@ def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, 
         if (action not in ACTIONS or not isinstance(args, dict) or budget is None
                 or (msg_id is not None and not isinstance(msg_id, str))):
             return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+        # Never expose screenshots, HDMI switching, or raw typing over a public Funnel proxy.
+        if action in LOCAL_ONLY_ACTIONS and (
+            request.headers.get("X-Forwarded-For")
+            or request.headers.get("X-Forwarded-Host")
+            or request.headers.get("Tailscale-User-Login")
+        ):
+            return reject(403, "local_only")
 
         async def execute() -> dict:
             if budget < MIN_BUDGET_S and action != "state":
@@ -284,7 +307,7 @@ def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, 
             except asyncio.CancelledError:
                 # The caller hung up mid-command (handler_cancellation): what was done so far is
                 # unknown from here, so say that it happened before letting the cancel through.
-                log("command_cancelled", action=action, args=args, ms=int((time.monotonic() - t0) * 1000))
+                log("command_cancelled", action=action, args=_safe_log_args(args), ms=int((time.monotonic() - t0) * 1000))
                 raise
             except Exception as e:  # noqa: BLE001 - a library error must not kill the daemon
                 log("error", action=action, error=type(e).__name__, detail=str(e)[:200])
@@ -306,7 +329,7 @@ def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, 
         else:
             result = await execute()
         ms = int((time.monotonic() - t0) * 1000)
-        log("command", action=action, args=args, ok=result["ok"], error=result.get("error"),
+        log("command", action=action, args=_safe_log_args(args), ok=result["ok"], error=result.get("error"),
             power=(result.get("state") or {}).get("power"), ms=ms, dup=result.get("duplicate", False))
         return web.json_response(dict(result, ms=ms))
 
@@ -314,9 +337,13 @@ def make_handler(verifier: Verifier, ctl: Controller, log, msg_ids: MessageIds, 
 
 
 def wol_sender(mac: str, broadcast: str, host: str):
-    pkt = b"\xff" * 6 + bytes.fromhex(mac.replace(":", "")) * 16
+    cleaned = mac.replace(":", "").replace("-", "").strip()
+    raw_mac = bytes.fromhex(cleaned) if len(cleaned) == 12 else b""
+    pkt = (b"\xff" * 6 + raw_mac * 16) if len(raw_mac) == 6 else b""
 
     def send() -> None:
+        if not pkt or not host:
+            raise TVError("unconfigured", "TVD_TV_HOST and TVD_TV_MAC must be configured")
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)

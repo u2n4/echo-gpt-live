@@ -47,6 +47,9 @@ func RememberThis(m Memory, onChange func()) *Tool {
 		DirectReturn: true,
 		Timeout:      3 * time.Second,
 		Run: func(ctx context.Context, args map[string]any) (string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			fact := strings.TrimSpace(str(args["fact"]))
 			if fact == "" {
 				return "", fmt.Errorf("ما فيه شي للحفظ")

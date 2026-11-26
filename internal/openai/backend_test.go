@@ -123,8 +123,11 @@ func TestSlowButProgressingStreamSucceeds(t *testing.T) {
 		t.Fatalf("usage not applied: %+v", r)
 	}
 	want := 200*0.20/1e6 + 800*0.02/1e6 + 2000*1.20/1e6
-	if diff := r.CostUSD - want; diff > 1e-12 || diff < -1e-12 {
-		t.Fatalf("cost = %.9f, want %.9f", r.CostUSD, want)
+	if r.CostUSD == nil {
+		t.Fatal("known model should have a cost estimate")
+	}
+	if diff := *r.CostUSD - want; diff > 1e-12 || diff < -1e-12 {
+		t.Fatalf("cost = %.9f, want %.9f", *r.CostUSD, want)
 	}
 }
 

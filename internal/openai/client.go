@@ -18,9 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -73,8 +75,8 @@ func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error)
 	if c.APIKey == "" {
 		return nil, ErrNoAPIKey
 	}
-	url := callsURL + "?model=" + c.Model
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(offerSDP))
+	endpoint := callsURL + "?model=" + url.QueryEscape(c.Model)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(offerSDP))
 	if err != nil {
 		return nil, err
 	}
@@ -86,8 +88,14 @@ func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error)
 		return nil, fmt.Errorf("create call: %w", err)
 	}
 	defer res.Body.Close()
+	id := callIDRe.FindString(res.Header.Get("Location"))
 	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
+		if id != "" {
+			hctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			return nil, errors.Join(fmt.Errorf("create call: %w", err), c.Hangup(hctx, id))
+		}
 		return nil, fmt.Errorf("create call: %w", err)
 	}
 	c.event("openai_create_call", "status", res.StatusCode, "ms", time.Since(t0).Milliseconds(),
@@ -100,7 +108,6 @@ func (c *Client) CreateCall(ctx context.Context, offerSDP string) (*Call, error)
 		c.event("openai_create_call_bad_sdp", "bytes", len(body))
 		return nil, fmt.Errorf("create call: %w", ErrBadSDP)
 	}
-	id := callIDRe.FindString(res.Header.Get("Location"))
 	if id == "" {
 		// some responses carry the id only in the body of a JSON error; try the answer too
 		id = callIDRe.FindString(answer)
@@ -172,7 +179,7 @@ func (s *Sideband) Read(ctx context.Context) error {
 		case strings.Contains(t, "transcript") || strings.Contains(t, "text") || strings.Contains(t, "delta"):
 			s.c.event("openai_event", "type", t, "chars", len(data))
 		default:
-			s.c.event("openai_event", "type", t, "raw", truncate(string(data), 500))
+			s.c.event("openai_event", "type", t, "bytes", len(data))
 		}
 	}
 }

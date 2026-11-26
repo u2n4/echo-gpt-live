@@ -462,7 +462,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "timeout")
 
     async def test_launch_switches_a_sleeping_tv_on_first(self):
-        # Ali: "شغّل يوتيوب" with the TV off wakes it, switches it on, then opens the app.
+        # "شغّل يوتيوب" with the TV off wakes it, switches it on, then opens the app.
         box = FakeBox(awake=False, wake_after=2)
         ctl, remotes = make(box, is_on=False)
         state = await ctl.launch("youtube", 4.0)

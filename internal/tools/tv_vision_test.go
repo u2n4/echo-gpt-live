@@ -18,6 +18,7 @@ type mockTVVision struct {
 	actions []string
 	args    []map[string]any
 	app     string
+	input   string
 }
 
 func (m *mockTVVision) Do(_ context.Context, action string, args map[string]any, _ time.Duration) (tv.Result, error) {
@@ -27,7 +28,7 @@ func (m *mockTVVision) Do(_ context.Context, action string, args map[string]any,
 	m.args = append(m.args, args)
 	switch action {
 	case "screenshot":
-		return tv.Result{OK: true, ImageB64: "/9j/4AAQSkZJRg=="}, nil
+		return tv.Result{OK: true, Input: m.input, ImageB64: "/9j/4AAQSkZJRg=="}, nil
 	case "state":
 		return tv.Result{OK: true, State: tv.State{Power: "on", Connected: true, App: m.app}}, nil
 	default:
@@ -95,7 +96,7 @@ func TestTVVisionComputerUseLoopTypesAndSelects(t *testing.T) {
 	tvVisionURL = oai.URL
 	defer func() { tvVisionURL = oldURL }()
 
-	mock := &mockTVVision{app: "com.netflix.ninja"}
+	mock := &mockTVVision{input: "hdmi3", app: "com.netflix.ninja"}
 	tool := TVVision(TVVisionConfig{
 		Client: mock,
 		APIKey: "test-key",
@@ -165,7 +166,7 @@ func TestTVVisionRejectsPrematurePermissionQuestion(t *testing.T) {
 	tvVisionURL = oai.URL
 	defer func() { tvVisionURL = oldURL }()
 
-	mock := &mockTVVision{app: "com.google.android.youtube.tv"}
+	mock := &mockTVVision{input: "hdmi3", app: "com.google.android.youtube.tv"}
 	tool := TVVision(TVVisionConfig{
 		Client: mock,
 		APIKey: "test-key",
@@ -184,5 +185,16 @@ func TestTVVisionRejectsPrematurePermissionQuestion(t *testing.T) {
 	}
 	if !strings.Contains(out, "شغّلت") {
 		t.Fatalf("unexpected out: %q", out)
+	}
+}
+
+func TestAppDescriptionRejectsUnconfirmedInput(t *testing.T) {
+	for _, input := range []string{"hdmi2", "unknown", ""} {
+		mock := &mockTVVision{input: input}
+		// A rejected frame must return before the HTTP client is used.
+		_, err := describeTVScreen(context.Background(), mock, nil, "", "", "", "", "", "netflix")
+		if err == nil {
+			t.Fatalf("accepted input %q", input)
+		}
 	}
 }

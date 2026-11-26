@@ -112,7 +112,7 @@ func TVVision(cfg TVVisionConfig) *Tool {
 		},
 		Access:       Read,
 		DirectReturn: true,
-		Timeout:      65 * time.Second,
+		Timeout:      42 * time.Second,
 		Run: func(ctx context.Context, args map[string]any) (string, error) {
 			if cfg.Client == nil {
 				return "", fmt.Errorf("التلفزيون غير مربوط حالياً")
@@ -144,7 +144,7 @@ func TVVision(cfg TVVisionConfig) *Tool {
 				}
 				sleepCtx(ctx, 1200*time.Millisecond)
 				if mode == "describe" && cfg.APIKey != "" {
-					if ans, err := describeTVScreen(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, goal); err == nil && ans != "" {
+					if ans, err := describeTVScreen(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, goal, app); err == nil && ans != "" {
 						return ans, nil
 					}
 				}
@@ -208,7 +208,7 @@ func TVVision(cfg TVVisionConfig) *Tool {
 
 			// 6. Pure describe mode (single screenshot -> ~2.5 s).
 			if mode == "describe" {
-				ans, err := describeTVScreen(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, goal)
+				ans, err := describeTVScreen(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, goal, app)
 				if err != nil {
 					return "ما قدرت أشوف شاشة التلفزيون الحين، تأكد إن التلفزيون شغّال.", nil
 				}
@@ -232,7 +232,7 @@ func TVVision(cfg TVVisionConfig) *Tool {
 			if episode != "" {
 				fullGoal += " | الحلقة المطلوبة: " + episode
 			}
-			return runVisionLoop(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, app, fullGoal, query, mode == "last_watched", 8, activate)
+			return runVisionLoop(ctx, cfg.Client, httpClient, cfg.APIKey, cfg.Model, cfg.Effort, cfg.ServiceTier, app, fullGoal, query, mode == "last_watched", 5, activate)
 		},
 	}
 }
@@ -260,10 +260,13 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	}
 }
 
-func describeTVScreen(ctx context.Context, client TVDoer, httpClient *http.Client, apiKey, model, effort, serviceTier, goal string) (string, error) {
+func describeTVScreen(ctx context.Context, client TVDoer, httpClient *http.Client, apiKey, model, effort, serviceTier, goal, app string) (string, error) {
 	sc, err := client.Do(ctx, "screenshot", map[string]any{"max_width": 896, "quality": 7}, 7*time.Second)
 	if err != nil || !sc.OK || sc.ImageB64 == "" {
 		return "", fmt.Errorf("screenshot failed: %v %s", err, sc.Error)
+	}
+	if app != "" && app != "cameras" && sc.Input != "hdmi3" {
+		return "", fmt.Errorf("app input unconfirmed")
 	}
 	sys := "أنتِ مساعدة صوتية ذكية (أسترا) تشوفين شاشة التلفزيون الحين وتردّين باللهجة الخليجية الدافئة في جملة أو جملتين قصيرتين واضحتين فقط (بدون نقاط ولا تنسيق، وبدون مناداة المستخدم بأي اسم شخصي، وبدون أسئلة متابعة). " +
 		"إذا كانت الشاشة سوداء تماماً فاذكري بلطف إنه الظاهر فيه فيديو محمي (DRM) شغّال أو الشاشة مطفية. " +
@@ -273,14 +276,17 @@ func describeTVScreen(ctx context.Context, client TVDoer, httpClient *http.Clien
 
 // isPrematureVisionAsk detects when the Vision model tried to stop mid-task and ask the user
 // permission ("سويت كذا، تبيني أشغل اللي بعده؟") instead of finishing the goal autonomously.
+// Deliberately matches explicit permission/mid-progress phrases rather than bare punctuation so
+// legitimate movie/video titles ending in '?' or '؟' are never rejected.
 func isPrematureVisionAsk(say string) bool {
 	s := strings.TrimSpace(say)
 	if s == "" {
 		return false
 	}
 	for _, marker := range []string{
-		"؟", "?", "تبيني", "تبغيني", "تحب ", "تحبين", "ما بدأت", "ما دخلت", "ما شغلت",
-		"للحين تتحمل", "للحين ما", "وللحين ما", "بس ما دخلت", "ما في مقطع مفتوح",
+		"تبيني أ", "تبيني ا", "تبغيني أ", "تبغيني ا", "تحب أكمل", "تحبين أكمل",
+		"ما بدأت أي تشغيل", "ما دخلت الفيديوهات", "للحين تتحمل", "بس ما دخلت",
+		"ما في مقطع مفتوح", "ولا شغلت أي شي",
 	} {
 		if strings.Contains(s, marker) {
 			return true
@@ -303,6 +309,16 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 			}
 			return "ما قدرت أشوف شاشة التلفزيون الحين.", nil
 		}
+		// Privacy guard: if Huawei TV is currently showing security cameras (hdmi2) and the user
+		// asked for an app (Netflix/YouTube/Shahid), switch back to Xiaomi BEFORE uploading any frame.
+		if sc.Input != "hdmi3" && app != "cameras" && app != "" {
+			if sw, serr := client.Do(ctx, "switch_input", map[string]any{"input": "xiaomi"}, 9*time.Second); serr == nil && sw.OK {
+				history = append(history, fmt.Sprintf("step %d: auto-switched from cameras to xiaomi", step+1))
+				sleepCtx(ctx, 800*time.Millisecond)
+				continue
+			}
+			return "ما قدرت أتأكد إن الشاشة على الشاومي.", nil
+		}
 		dec, err := decideVisionStep(ctx, httpClient, apiKey, model, effort, serviceTier, sc.ImageB64, goal, query, history, step+1, maxSteps)
 		if err != nil {
 			if lastSay != "" {
@@ -318,9 +334,9 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 			(dec.Action == "launch" && dec.App != "") ||
 			(dec.Action == "launch_url" && dec.URL != "") ||
 			(dec.Action == "switch_input" && dec.Input != "")
-		// Never stop early to ask permission mid-task ("تبيني أفتح؟ / تبيني أشغل؟")!
+		// Never stop early to ask permission mid-task ("تبيني أفتح؟ / تبيني أشغل؟") on action goals!
 		if !hasWork && (dec.Done || dec.Action == "done") {
-			if step < maxSteps-1 && isPrematureVisionAsk(dec.Say) {
+			if !mustReadResult && step < maxSteps-1 && isPrematureVisionAsk(dec.Say) {
 				history = append(history, fmt.Sprintf("step %d: REJECTED premature stop (%q) — DO NOT ask the user! You ALREADY have permission; execute the next TV action NOW!", step+1, dec.Say))
 				sleepCtx(ctx, 400*time.Millisecond)
 				continue
@@ -341,7 +357,10 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 			if inp == "" {
 				inp = "xiaomi"
 			}
-			_, _ = client.Do(ctx, "switch_input", map[string]any{"input": inp}, 9*time.Second)
+			if res, derr := client.Do(ctx, "switch_input", map[string]any{"input": inp}, 9*time.Second); derr != nil || !res.OK {
+				history = append(history, fmt.Sprintf("step %d: switch_input %s failed", step+1, inp))
+				continue
+			}
 			if onActive != nil {
 				onActive()
 			}
@@ -366,7 +385,10 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 				steps = append(steps, map[string]any{"key": k, "count": cnt, "delay_ms": 70})
 			}
 			if len(steps) > 0 {
-				_, _ = client.Do(ctx, "sequence", map[string]any{"steps": steps}, 5*time.Second)
+				if res, derr := client.Do(ctx, "sequence", map[string]any{"steps": steps}, 5*time.Second); derr != nil || !res.OK {
+					history = append(history, fmt.Sprintf("step %d: sequence failed", step+1))
+					continue
+				}
 				if onActive != nil {
 					onActive()
 				}
@@ -393,7 +415,10 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 					sleepCtx(ctx, 200*time.Millisecond)
 				}
 				// Pace 180 ms per char so Netflix's animated 6x6 JS keyboard NEVER drops a single letter!
-				_, _ = client.Do(ctx, "text", map[string]any{"text": txt, "pace_ms": 180}, 10*time.Second)
+				if res, derr := client.Do(ctx, "text", map[string]any{"text": txt, "pace_ms": 180}, 10*time.Second); derr != nil || !res.OK {
+					history = append(history, fmt.Sprintf("step %d: text typing failed", step+1))
+					continue
+				}
 				if onActive != nil {
 					onActive()
 				}
@@ -402,7 +427,10 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 			}
 		case "launch":
 			if dec.App != "" {
-				_, _ = client.Do(ctx, "launch", map[string]any{"app": strings.ToLower(dec.App)}, 7*time.Second)
+				if res, derr := client.Do(ctx, "launch", map[string]any{"app": strings.ToLower(dec.App)}, 7*time.Second); derr != nil || !res.OK {
+					history = append(history, fmt.Sprintf("step %d: launch %s failed", step+1, dec.App))
+					continue
+				}
 				if onActive != nil {
 					onActive()
 				}
@@ -411,7 +439,10 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 			}
 		case "launch_url":
 			if dec.URL != "" {
-				_, _ = client.Do(ctx, "launch_url", map[string]any{"url": dec.URL}, 7*time.Second)
+				if res, derr := client.Do(ctx, "launch_url", map[string]any{"url": dec.URL}, 7*time.Second); derr != nil || !res.OK {
+					history = append(history, fmt.Sprintf("step %d: launch_url failed", step+1))
+					continue
+				}
 				if onActive != nil {
 					onActive()
 				}
@@ -434,7 +465,7 @@ func runVisionLoop(ctx context.Context, client TVDoer, httpClient *http.Client, 
 	if lastSay != "" {
 		return lastSay, nil
 	}
-	return "تم، وصلت للمكان المطلوب على التلفزيون.", nil
+	return "ما قدرت أتأكد إن الطلب اكتمل على التلفزيون.", nil
 }
 
 // visionPlaybookSystem is kept 100% static so OpenAI's prompt cache hits across every vision step!
@@ -534,6 +565,7 @@ func callVisionText(ctx context.Context, httpClient *http.Client, apiKey, model,
 	})
 	body := map[string]any{
 		"model":             model,
+		"store":             false,
 		"max_output_tokens": maxTokens,
 		"prompt_cache_key":  "astra-vision-v1",
 		"input":             input,

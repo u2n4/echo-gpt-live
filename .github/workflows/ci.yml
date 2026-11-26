@@ -17,6 +17,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
+      - name: Install libopus on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopus0
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -33,3 +36,8 @@ jobs:
         run: node --check lambda/index.mjs
       - name: Offline Lambda regressions
         run: node --test lambda/index.test.mjs
+      - name: TV daemon Python tests
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m pip install --quiet -r tvd/requirements.txt
+          python3 -m unittest discover -s tvd -p "test_*.py"

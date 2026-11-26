@@ -106,6 +106,10 @@ class HuaweiTV:
             proc.kill()
             await proc.wait()
             raise TVError("timeout", f"adb timed out ({args[0]})") from None
+        except BaseException:
+            proc.kill()
+            await proc.wait()
+            raise
         return proc.returncode or 0, out, err
 
     async def _ensure_connected(self, timeout: float = 2.5, force: bool = False) -> None:
@@ -224,13 +228,15 @@ class HuaweiTV:
                                 "height": h,
                                 "input": self._current_input or "unknown",
                             }
-            # Fallback: PNG via screencap -p (slower on TV CPU, works without ffmpeg).
+            # Fallback: PNG via screencap -p (bounded to fit within client's 512 KiB JSON limit).
             rc, png, err = await self._exec(
                 self.adb, "-s", self.host, "exec-out", "screencap", "-p",
                 timeout=max(3.0, timeout),
             )
             if rc != 0 or len(png) < 256:
                 raise TVError("unreachable", f"screencap failed: {err.decode('utf-8', 'replace')[:120]}")
+            if len(png) > 340_000:
+                raise TVError("oversize", "screenshot requires ffmpeg to produce a bounded JPEG")
             return {
                 "image_b64": base64.b64encode(png).decode("ascii"),
                 "bytes": len(png),

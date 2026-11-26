@@ -33,6 +33,7 @@ def events(paths):
 
 
 def main(logs):
+    echo_to_oai = {}
     created = []          # (source, session_id)
     created_400 = 0
     started = {}          # session_id -> mono_ms
@@ -43,20 +44,23 @@ def main(logs):
 
     for src, e in events(logs):
         ev = e.get("ev")
+        sid = (src, e.get("sess"))
+        if e.get("session_id"):
+            echo_to_oai[sid] = e["session_id"]
         if ev == "live_create_session":
             if e.get("status") in (200, 201):
-                created.append((src, e.get("sess")))
+                created.append((src, sid))
                 per_source[src]["creates"] += 1
             elif e.get("status") == 400:
                 created_400 += 1
         elif ev == "live_session_started":
-            started[e.get("sess")] = e.get("mono_ms")
+            started[sid] = e.get("mono_ms")
         elif ev == "live_leg_close":
             # Key on the SAME identifier as `started`, which is the Echo session's short id.
             # live_leg_close carries BOTH that and OpenAI's own session_id, and preferring
             # session_id here compares two different namespaces: every started session then looks
             # as though it never closed. It reported sixteen leaks on a machine with none.
-            closed[e.get("sess")] = (e.get("age_s", 0.0), e.get("reason"),
+            closed[sid] = (e.get("age_s", 0.0), e.get("reason"),
                                      e.get("session_id"))
             per_source[src]["seconds"] += float(e.get("age_s") or 0.0)
         elif ev == "live_hangup":
@@ -93,19 +97,14 @@ def main(logs):
     #                   was NOT closed" - and it was never computed. Worse, connected time is summed
     #                   from live_leg_close.age_s, so a session that never closed contributes
     #                   exactly ZERO seconds. The worst case was being counted as free.
-    never_started = [sid for _, sid in created if sid and sid not in started]
+    never_started = [sid for _, sid in created if sid[1] and sid not in started]
     # None is what an older log line carries when it predates session tagging; it is not a session.
-    # A session counts as closed if its own leg closed, OR if a later start's ledger sweep closed
-    # it. `closed` is keyed by the Echo id and `swept` by OpenAI's, so the sweep is matched by
-    # count: an unmatched start followed by a sweep of exactly that many orphans is accounted for.
-    never_closed = [sid for sid in started if sid and sid not in closed]
-    if swept and len(never_closed) <= len(swept):
-        swept_note = (f"   {len(never_closed)} of these were closed by a later start's ledger "
-                      f"sweep ({len(swept)} orphan(s) swept in total), so they did stop billing.")
-        never_closed_accounted, never_closed = never_closed, []
-    else:
-        swept_note = None
-        never_closed_accounted = []
+    # Sweeps use OpenAI IDs; matching counts across namespaces can hide a paid orphan.
+    unmatched = [sid for sid in started if sid[1] and sid not in closed]
+    never_closed_accounted = [sid for sid in unmatched if echo_to_oai.get(sid) in swept]
+    never_closed = [sid for sid in unmatched if sid not in never_closed_accounted]
+    swept_note = (f"   {len(never_closed_accounted)} matched session(s) were closed by a ledger sweep."
+                  " Swept durations are not included in the connected-time total.")
     print("--- per source ---")
     for src in sorted(per_source, key=lambda s: -per_source[s]["seconds"]):
         v = per_source[src]
@@ -141,7 +140,7 @@ def main(logs):
         print("   sweep; one that appears here and is not in the ledger was never swept.")
     else:
         print()
-        print("   every session that started also closed: the total above is the whole bill.")
+        print("   every recorded start has a close or an identity-matched sweep; totals cover recorded durations only.")
 
 
 if __name__ == "__main__":

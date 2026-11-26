@@ -495,8 +495,8 @@ class Controller:
             return self._snapshot()
 
     async def launch(self, app, timeout: float) -> dict:
-        """Open an app, switching the TV on first when it is off or asleep (Ali, 2026-10-18:
-        "شغّل يوتيوب" should work with the TV off). A power_off that arrives meanwhile cancels it,
+        """Open an app, switching the TV on first when it is off or asleep (e.g. "شغّل يوتيوب"
+        works even with the TV off). A power_off that arrives meanwhile cancels it,
         exactly as it cancels power_on."""
         if app not in APPS:
             raise TVError("bad_request", "unknown app")

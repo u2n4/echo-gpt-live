@@ -65,7 +65,7 @@ func TestParseRemote(t *testing.T) {
 		{say: "ثلاث مرات", active: true},
 		{say: "أرجع الصوت", active: true, cmds: "set_mute", pure: true},
 		{say: "تمام", active: true},
-		// an app any time; tvd switches the TV on first (Ali)
+		// an app any time; tvd switches the TV on first
 		{say: "شغلي يوتيوب", enter: true, cmds: "youtube", pure: true},
 		{say: "يا سول افتح نتفلكس", enter: true, cmds: "netflix", pure: true},
 		{say: "شغل لي اليوتيوب لو سمحت", enter: true, cmds: "youtube", pure: true},
@@ -117,7 +117,7 @@ func TestParseRemote(t *testing.T) {
 		{say: "روحي تحت مرتين ثم اضغطي اللي بالنص", active: true, cmds: "down,down,select", pure: true},
 		{say: "قدمي المقطع", enter: true, cmds: "fast_forward", pure: true},
 		{say: "المقطع الجاي", enter: true, cmds: "next", pure: true},
-		// Multi-step compound commands with "بعدين" and counts up to 10 (Ali's real test!)
+		// Multi-step compound commands with "بعدين" and counts up to 10
 		{say: "اضغط بعدين نزلي تحت 5 مرات", active: true, cmds: "select,down,down,down,down,down", pure: true},
 		{say: "اضغطي وبعدين انزلي تحت خمس مرات", active: true, cmds: "select,down,down,down,down,down", pure: true},
 		{say: "تحت 7 مرات", active: true, cmds: "down,down,down,down,down,down,down", pure: true},
@@ -462,7 +462,7 @@ func TestRemoteStreamingRapidFire(t *testing.T) {
 	r.Feed(tok, "تحت ")
 	waitFor(t, "first word fires immediately on second word", func() bool { return strings.HasPrefix(f.got(), "up") })
 	r.Feed(tok, "يمين ")
-	r.Feed(tok, "اضغط ")
+	r.Feed(tok, "انتر ")
 	r.Feed(tok, "تحت ")
 	r.Feed(tok, "فوق")
 	waitFor(t, "all rapid words fired", func() bool { return f.got() == "up,down,right,select,down,up" })

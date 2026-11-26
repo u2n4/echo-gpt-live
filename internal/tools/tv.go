@@ -201,8 +201,9 @@ func TVControl(client TVDoer, onActive func()) *Tool {
 					replyOK = "تم، بدّلت كتم الصوت."
 				} else {
 					res, err = client.Do(ctx, "set_mute", map[string]any{"mute": mute}, 3*time.Second)
-					// If the TV box did not report its mute state, fall back to direct toggle_mute.
-					if err == nil && !res.OK && res.Error == "unknown" {
+					// If the TV box did not report its mute state, only fall back to toggle on mute=true
+					// (never risk muting when the user explicitly asked to unmute!).
+					if err == nil && !res.OK && res.Error == "unknown" && mute {
 						res, err = client.Do(ctx, "toggle_mute", nil, 3*time.Second)
 					}
 					if mute {

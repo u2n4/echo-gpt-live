@@ -49,10 +49,19 @@ def db(x):
 
 
 def main(path):
-    w = wave.open(path)
-    rate, n = w.getframerate(), w.getnframes()
-    data = struct.unpack("<%dh" % n, w.readframes(n))
-    w.close()
+    try:
+        with wave.open(path) as w:
+            rate, n = w.getframerate(), w.getnframes()
+            if w.getnchannels() != 1 or w.getsampwidth() != 2 or rate <= 0:
+                sys.exit("expected mono 16-bit PCM with a positive sample rate")
+            if n > rate * 1800:
+                sys.exit("WAV exceeds the 30-minute analysis limit; split it first")
+            raw = w.readframes(n)
+            if len(raw) != 2 * n:
+                sys.exit("truncated WAV data")
+            data = struct.unpack(f"<{n}h", raw)
+    except (OSError, wave.Error, EOFError) as e:
+        sys.exit(f"cannot read WAV: {e}")
 
     window = [0.5 - 0.5 * math.cos(2 * math.pi * i / (SIZE - 1)) for i in range(SIZE)]
     binhz = rate / SIZE
@@ -100,4 +109,6 @@ def main(path):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit("usage: ns-signature.py <mono-16bit.wav>")
     main(sys.argv[1])
